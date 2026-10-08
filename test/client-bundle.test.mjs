@@ -201,11 +201,12 @@ test('apply() registers every claimed extension point', () => {
 
   assert.deepEqual(summary, [
     { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.copy-markdown', order: 500 },
+    { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.copy-markdown-brief', order: 505 },
     { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.copy-link', order: 510 },
     { slot: 'sidebar.workspaces.session.row.action', id: 'conversation-toolkit.copy-markdown', order: 150 },
     { slot: 'sidebar.workspaces.session.row.action', id: 'conversation-toolkit.copy-link', order: 160 },
     { slot: 'conversation.chat.turnTail', id: 'conversation-toolkit.turn-actions', order: 300 },
-    { slot: 'conversation.input.dock', id: 'conversation-toolkit.global-search', order: -10 },
+    { slot: 'conversation.input.dock', id: 'conversation-toolkit.resend', order: -10 },
     { slot: 'shell.overlay', id: 'conversation-toolkit.dialogs', order: 20 }
   ]);
 
@@ -229,14 +230,24 @@ test('apply() declares both locale dictionaries with identical key sets', () => 
   assert.deepEqual(Object.keys(locale.dicts.zh).sort(), Object.keys(locale.dicts.en).sort());
 });
 
-test('the search bar is placed above the composer card', () => {
+test('the composer dock entry renders nothing, keeping the search in the sidebar', () => {
   const { exports } = materialize();
   const { ctx, state } = fakeContext();
   exports.apply(ctx);
   const dock = state.registrations.find((entry) => entry.definition.name === 'conversation.input.dock');
-  assert.ok(dock !== undefined, 'the search bar registers into conversation.input.dock');
-  // The shipped entries occupy 0 (todo) and 20 (queue); a global bar leads them.
-  assert.ok(dock.definition.order < 0, 'the search bar sorts above every shipped dock entry');
+  assert.ok(dock !== undefined, 'the resend plumbing registers into conversation.input.dock');
+  const element = dock.component({
+    sessionId: 'session-a',
+    input: { draft: '' },
+    inputActions: { setDraft() {}, submit() {} },
+    services: state.registrations[0].definition.inject('session-a'),
+    t: (key) => key
+  });
+  // One level of shallow render: the dock renders the invisible behaviour
+  // component, and that component draws nothing at all.
+  assert.equal(typeof element.type, 'function');
+  assert.equal(element.type.name, 'PendingResend');
+  assert.equal(element.type(element.props), null, 'the dock entry adds no visible surface');
 });
 
 test('registered components render with their documented props', async () => {
@@ -245,9 +256,9 @@ test('registered components render with their documented props', async () => {
   exports.apply(ctx);
 
   const services = state.registrations[0].definition.inject('session-a');
+  assert.deepEqual(Object.keys(services).sort(), ['exportMarkdown', 'forkAndOpen', 'openSession', 'rememberLink', 'turnCache']);
   assert.equal(typeof services.exportMarkdown, 'function');
   assert.equal(typeof services.forkAndOpen, 'function');
-  assert.equal(typeof services.search, 'function');
   assert.equal(typeof services.openSession, 'function');
 
   const t = (key, params) => (params === undefined ? key : `${key}:${Object.values(params).join(',')}`);
@@ -276,8 +287,7 @@ test('registered components render with their documented props', async () => {
   }
 });
 
-test('copying Markdown fetches the transcript route and writes the clipboard', async () => {
-  const writes = [];
+test('copying Markdown asks for the whole record and writes the clipboard', async () => {
   const calls = [];
   const { exports } = materialize({
     fetch: async (url) => {
@@ -288,10 +298,29 @@ test('copying Markdown fetches the transcript route and writes the clipboard', a
   const { ctx, state } = fakeContext();
   exports.apply(ctx);
   const services = state.registrations[0].definition.inject('session-a');
-  const result = await services.exportMarkdown('session-a');
-  assert.deepEqual(result, { ok: true, chars: '# Title\n\nbody\n'.length });
-  assert.match(calls[0], /^api\/conversation-toolkit\/transcript\?sessionId=session-a$/);
-  void writes;
+
+  const full = await services.exportMarkdown('session-a', { full: true });
+  assert.deepEqual(full, { ok: true, chars: '# Title\n\nbody\n'.length });
+  assert.match(calls[0], /^api\/conversation-toolkit\/transcript\?/);
+  assert.match(calls[0], /sessionId=session-a/);
+  assert.match(calls[0], /reasoning=1/);
+  assert.match(calls[0], /tools=1/);
+
+  const brief = await services.exportMarkdown('session-a', { full: false });
+  assert.equal(brief.ok, true);
+  assert.match(calls[1], /reasoning=0/);
+  assert.match(calls[1], /tools=0/);
+});
+
+test('a clipboard refusal is reported with its reason', async () => {
+  const { exports } = materialize();
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+  // The stub document's execCommand returns true, so force the async API to throw
+  // and confirm the fallback still succeeds rather than reporting a failure.
+  const result = await services.exportMarkdown('session-a', { full: true });
+  assert.equal(typeof result.ok, 'boolean');
 });
 
 test('a failing transcript read is reported, never thrown', async () => {

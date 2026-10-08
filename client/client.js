@@ -60,19 +60,6 @@ window.__ModuleLoader__.load({
 .ctk-icon-button:disabled{cursor:default;opacity:.4}
 .ctk-action-row{display:flex;align-items:center;gap:2px;flex-wrap:wrap}
 .ctk-action-label{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;margin-right:4px}
-.ctk-dock{display:flex;flex-direction:column;gap:6px;width:100%}
-.ctk-searchbar{display:flex;align-items:center;gap:8px;box-sizing:border-box;width:100%;min-height:34px;padding:0 10px;border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-lg,10px);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary)}
-.ctk-searchbar:focus-within{border-color:var(--dsw-alias-border-l2)}
-.ctk-searchbar svg{flex:none;width:15px;height:15px;color:var(--dsw-alias-label-tertiary)}
-.ctk-search-input{flex:1;min-width:0;border:0;outline:none;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:20px;padding:6px 0}
-.ctk-search-input::placeholder{color:var(--dsw-alias-label-tertiary)}
-.ctk-search-hint{flex:none;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;border:.5px solid var(--dsw-alias-border-l1);border-radius:4px;padding:1px 5px}
-.ctk-results{display:flex;flex-direction:column;max-height:320px;overflow-y:auto;border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-lg,10px);background:var(--dsw-alias-bg-overlay);padding:4px}
-.ctk-result{display:flex;flex-direction:column;gap:2px;box-sizing:border-box;width:100%;padding:8px 10px;border:0;border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
-.ctk-result:hover,.ctk-result[data-active]{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12))}
-.ctk-result-title{color:var(--dsw-alias-label-primary);font-size:13px;line-height:18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ctk-result-snippet{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:17px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.ctk-result-meta{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}
 .ctk-empty{padding:10px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
 .ctk-overlay{position:fixed;inset:0;z-index:1200;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.32)}
 .ctk-dialog{display:flex;flex-direction:column;gap:14px;box-sizing:border-box;width:min(560px,calc(100vw - 32px));max-height:calc(100vh - 64px);padding:18px;border-radius:var(--dsw-radius-panel,14px);background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);box-shadow:0 12px 40px rgba(0,0,0,.28);font-size:13px;line-height:20px}
@@ -218,34 +205,52 @@ window.__ModuleLoader__.load({
     const pendingResend = new Map();
 
     /**
-     * Copy text to the clipboard, falling back to a hidden textarea.
+     * Copy text to the clipboard.
+     *
+     * The async Clipboard API needs a secure context and a focused document, and
+     * is unavailable when the app is opened over a plain-HTTP LAN address, so a
+     * hidden-textarea `execCommand` fallback follows it. That fallback needs the
+     * gesture's activation window, which is why the caller fetches first and
+     * copies last, and why the selection is made explicitly rather than relying
+     * on `select()` alone.
      *
      * @param text - the text to copy.
-     * @returns whether the copy succeeded.
+     * @returns `{ ok }` or `{ ok: false, reason }` naming what failed.
      */
     async function writeClipboard(text) {
+      let reason = 'clipboard API unavailable';
       try {
-        if (navigator.clipboard?.writeText !== undefined) {
+        if (typeof navigator.clipboard?.writeText === 'function') {
           await navigator.clipboard.writeText(text);
-          return true;
+          return { ok: true };
         }
-      } catch {
-        /* fall through to the legacy path */
+      } catch (error) {
+        reason = describeError(error);
       }
       try {
         const area = document.createElement('textarea');
         area.value = text;
         area.setAttribute('readonly', '');
+        area.setAttribute('aria-hidden', 'true');
         area.style.position = 'fixed';
+        area.style.top = '0';
+        area.style.left = '0';
+        area.style.width = '1px';
+        area.style.height = '1px';
+        area.style.padding = '0';
+        area.style.border = 'none';
         area.style.opacity = '0';
         document.body.appendChild(area);
+        area.focus();
         area.select();
+        area.setSelectionRange(0, text.length);
         const ok = document.execCommand('copy');
         document.body.removeChild(area);
-        return ok;
+        if (ok) return { ok: true };
+        return { ok: false, reason: 'the browser refused the copy command' };
       } catch (error) {
         console.error('[conversation-toolkit] clipboard write failed:', error);
-        return false;
+        return { ok: false, reason: describeError(error) };
       }
     }
 
@@ -272,8 +277,10 @@ window.__ModuleLoader__.load({
      */
     async function fetchTranscript(sessionId, options = {}) {
       const params = new URLSearchParams({ sessionId });
-      if (options.reasoning === true) params.set('reasoning', '1');
-      if (options.tools === true) params.set('tools', '1');
+      // Stated explicitly rather than relying on the route default, so the two
+      // actions keep their meaning if the Host default ever changes.
+      params.set('reasoning', options.reasoning === false ? '0' : '1');
+      params.set('tools', options.tools === false ? '0' : '1');
       const response = await fetch(`${TRANSCRIPT_ROUTE}?${params.toString()}`, { credentials: 'same-origin' });
       if (!response.ok) {
         let detail = `HTTP ${String(response.status)}`;
@@ -437,30 +444,55 @@ window.__ModuleLoader__.load({
      * @param props - owner props plus the injected services.
      * @returns the menu row.
      */
-    function CopyMarkdownMenuItem({ sessionId, services, useMenuOpenState, t }) {
-      const closeMenu = useMenuCloser(useMenuOpenState);
-      const [busy, setBusy] = React.useState(false);
-      const onSelect = React.useCallback(() => {
-        closeMenu();
-        setBusy(true);
-        services
-          .exportMarkdown(sessionId)
-          .then((result) => {
-            if (result.ok) {
-              notify(t('toast.markdownCopied', { n: String(result.chars) }));
-              return;
-            }
-            notify(result.code === 'copy' ? t('toast.copyFailed') : t('toast.exportFailed', { detail: result.detail ?? '' }), 'error');
-          })
-          .finally(() => setBusy(false));
-      }, [closeMenu, services, sessionId, t]);
-      return h(
-        'button',
-        { type: 'button', role: 'menuitem', className: 'ctk-menu-item', disabled: busy, onClick: onSelect },
-        h(IconCopy, null),
-        h('span', null, busy ? t('menu.copyMarkdown.busy') : t('menu.copyMarkdown'))
-      );
+    /**
+     * Build one sidebar menu row that copies the conversation as Markdown.
+     *
+     * Two variants share this factory: the full record (every turn, the
+     * assistant's reasoning, every tool call and result) and the compact one
+     * (user text and answers only).
+     *
+     * @param options - the variant.
+     * @param options.full - copy the whole record rather than the compact form.
+     * @param options.labelKey - locale key for the row label.
+     * @returns the menu row component.
+     */
+    function copyMarkdownMenuItem(options) {
+      return function CopyMarkdownMenuItem({ sessionId, services, useMenuOpenState, t }) {
+        const closeMenu = useMenuCloser(useMenuOpenState);
+        const [busy, setBusy] = React.useState(false);
+        const onSelect = React.useCallback(() => {
+          closeMenu();
+          setBusy(true);
+          services
+            .exportMarkdown(sessionId, { full: options.full })
+            .then((result) => {
+              if (result.ok) {
+                notify(t('toast.markdownCopied', { n: String(result.chars) }));
+                return;
+              }
+              notify(
+                result.code === 'copy'
+                  ? t('toast.copyFailedDetail', { detail: result.detail ?? '' })
+                  : t('toast.exportFailed', { detail: result.detail ?? '' }),
+                'error'
+              );
+            })
+            .finally(() => setBusy(false));
+        }, [closeMenu, services, sessionId, t]);
+        return h(
+          'button',
+          { type: 'button', role: 'menuitem', className: 'ctk-menu-item', disabled: busy, onClick: onSelect },
+          h(IconCopy, null),
+          h('span', null, busy ? t('menu.copyMarkdown.busy') : t(options.labelKey))
+        );
+      };
     }
+
+    /** Menu row (order 500): copy the whole conversation, reasoning and tools included. */
+    const CopyMarkdownMenuItem = copyMarkdownMenuItem({ full: true, labelKey: 'menu.copyMarkdown' });
+
+    /** Menu row (order 505): copy only the user text and the answers. */
+    const CopyMarkdownBriefMenuItem = copyMarkdownMenuItem({ full: false, labelKey: 'menu.copyMarkdownBrief' });
 
     /**
      * Sidebar menu row: copy a deep link that reopens this conversation.
@@ -473,9 +505,9 @@ window.__ModuleLoader__.load({
       const onSelect = React.useCallback(() => {
         closeMenu();
         const link = deepLink(sessionId);
-        writeClipboard(link).then((ok) => {
-          if (!ok) {
-            notify(t('toast.copyFailed'), 'error');
+        writeClipboard(link).then((result) => {
+          if (!result.ok) {
+            notify(t('toast.copyFailedDetail', { detail: result.reason }), 'error');
             return;
           }
           services.rememberLink(sessionId, link);
@@ -501,7 +533,7 @@ window.__ModuleLoader__.load({
       const onSelect = React.useCallback(() => {
         setBusy(true);
         services
-          .exportMarkdown(sessionId)
+          .exportMarkdown(sessionId, { full: true })
           .then((result) => {
             if (result.ok) {
               notify(t('toast.markdownCopied', { n: String(result.chars) }));
@@ -534,9 +566,9 @@ window.__ModuleLoader__.load({
     function CopyLinkRowButton({ sessionId, services, t }) {
       const onSelect = React.useCallback(() => {
         const link = deepLink(sessionId);
-        writeClipboard(link).then((ok) => {
-          if (!ok) {
-            notify(t('toast.copyFailed'), 'error');
+        writeClipboard(link).then((result) => {
+          if (!result.ok) {
+            notify(t('toast.copyFailedDetail', { detail: result.reason }), 'error');
             return;
           }
           services.rememberLink(sessionId, link);
@@ -607,7 +639,9 @@ window.__ModuleLoader__.load({
           parts.push('', '<details><summary>Thinking</summary>', '', turn.assistant.reasoning, '', '</details>');
         }
         if (turn.assistant.text.trim() !== '') parts.push('', '### Assistant', '', turn.assistant.text);
-        writeClipboard(parts.join('\n')).then((ok) => notify(ok ? t('toast.turnCopied') : t('toast.copyFailed'), ok ? 'info' : 'error'));
+        writeClipboard(parts.join('\n')).then((result) =>
+          notify(result.ok ? t('toast.turnCopied') : t('toast.copyFailedDetail', { detail: result.reason }), result.ok ? 'info' : 'error')
+        );
       }, [guard, t, turn]);
 
       const onEdit = React.useCallback(() => {
@@ -692,190 +726,6 @@ window.__ModuleLoader__.load({
         button('edit', t('turn.edit'), IconPencil, onEdit, running),
         button('regen', t('turn.regenerate'), IconRefresh, onRegenerate, running),
         button('delete', t('turn.delete'), IconTrash, onDelete, running)
-      );
-    }
-
-    // ───────────────────────────────────────────────────────────────────────
-    // Components — global search above the composer
-    // ───────────────────────────────────────────────────────────────────────
-
-    /**
-     * The global conversation search bar.
-     *
-     * Renders above the composer card (`conversation.input.dock`) and searches
-     * every Session through the Client Session service's ranked full-text search,
-     * resolving titles and archived state from the standard slot hooks.
-     *
-     * @param props - the dock owner props plus the injected services.
-     * @returns the search bar and its result list.
-     */
-    function GlobalSearchBar(props) {
-      const t = typeof props.t === 'function' ? props.t : (key) => key;
-      const services = props.services;
-      const useSessions = typeof props.useSessions === 'function' ? props.useSessions : useNoValue;
-      const useWorkspaces = typeof props.useWorkspaces === 'function' ? props.useWorkspaces : useNoValue;
-      // Both snapshots can be absent before the Host baselines arrive.
-      const sessions = useSessions((snapshot) => snapshot);
-      const archivedIds = useWorkspaces((snapshot) => (snapshot === null || snapshot === undefined ? undefined : snapshot.archivedSessionIds));
-      const [query, setQuery] = React.useState('');
-      const [open, setOpen] = React.useState(false);
-      const [state, setState] = React.useState({ status: 'idle', items: [], error: null });
-      const inputRef = React.useRef(null);
-      const abortRef = React.useRef(null);
-
-      const archived = React.useMemo(() => new Set(Array.isArray(archivedIds) ? archivedIds : []), [archivedIds]);
-
-      /**
-       * Resolve one Session's display title from the standard session snapshot.
-       *
-       * @param id - the Session to name.
-       * @returns the display title.
-       */
-      const titleOf = React.useCallback(
-        (id) => {
-          const row = sessions?.byId?.[id];
-          return row?.displayTitle ?? row?.title ?? id;
-        },
-        [sessions]
-      );
-
-      React.useEffect(() => {
-        const term = query.trim();
-        if (term === '') {
-          abortRef.current?.abort();
-          setState({ status: 'idle', items: [], error: null });
-          return undefined;
-        }
-        const controller = new AbortController();
-        abortRef.current?.abort();
-        abortRef.current = controller;
-        setState((previous) => ({ status: 'loading', items: previous.items, error: null }));
-        const timer = setTimeout(() => {
-          if (services === null || services === undefined || typeof services.search !== 'function') {
-            setState({ status: 'error', items: [], error: 'search service unavailable' });
-            return;
-          }
-          services
-            .search(term, controller.signal)
-            .then((carried) => {
-              if (controller.signal.aborted) return;
-              if (!carried.ok) {
-                setState({ status: 'error', items: [], error: `${carried.error.code}: ${carried.error.message}` });
-                return;
-              }
-              setState({ status: 'ready', items: carried.value.items, error: null, hasMore: carried.value.hasMore });
-            })
-            .catch((error) => {
-              if (controller.signal.aborted) return;
-              setState({ status: 'error', items: [], error: describeError(error) });
-            });
-        }, 180);
-        return () => {
-          clearTimeout(timer);
-          controller.abort();
-        };
-      }, [query, services]);
-
-      const openResult = React.useCallback(
-        (id) => {
-          setOpen(false);
-          setQuery('');
-          try {
-            services.openSession(id);
-          } catch (error) {
-            notify(t('toast.openFailed', { detail: describeError(error) }), 'error');
-          }
-        },
-        [services, t]
-      );
-
-      const onKeyDown = React.useCallback(
-        (event) => {
-          if (event.key === 'Escape') {
-            event.stopPropagation();
-            setQuery('');
-            setOpen(false);
-            inputRef.current?.blur();
-          }
-          if (event.key === 'Enter' && state.items.length > 0) {
-            event.preventDefault();
-            openResult(state.items[0].sessionId);
-          }
-        },
-        [openResult, state.items]
-      );
-
-      const expanded = open || query.trim() !== '';
-
-      return h(
-        'div',
-        { className: 'ctk-dock', 'data-ctk': 'global-search' },
-        h(
-          'div',
-          { className: 'ctk-searchbar' },
-          h(IconSearch, null),
-          h('input', {
-            ref: inputRef,
-            className: 'ctk-search-input',
-            type: 'search',
-            value: query,
-            placeholder: t('search.placeholder'),
-            'aria-label': t('search.placeholder'),
-            spellCheck: false,
-            onFocus: () => setOpen(true),
-            onChange: (event) => setQuery(event.target.value),
-            onKeyDown
-          }),
-          query === '' ? h('span', { className: 'ctk-search-hint' }, t('search.hint')) : null,
-          query !== '' || open
-            ? h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'ctk-icon-button',
-                  title: t('close'),
-                  'aria-label': t('close'),
-                  onClick: () => {
-                    setQuery('');
-                    setOpen(false);
-                  }
-                },
-                h(IconClose, null)
-              )
-            : null
-        ),
-        expanded && query.trim() !== ''
-          ? h(
-              'div',
-              { className: 'ctk-results', role: 'listbox', 'aria-label': t('search.results') },
-              state.status === 'error'
-                ? h('div', { className: 'ctk-empty' }, t('search.failed', { detail: state.error ?? '' }))
-                : null,
-              state.status !== 'error' && state.items.length === 0
-                ? h('div', { className: 'ctk-empty' }, state.status === 'loading' ? t('search.searching') : t('search.empty'))
-                : null,
-              state.items.map((item) =>
-                h(
-                  'button',
-                  {
-                    key: item.sessionId,
-                    type: 'button',
-                    role: 'option',
-                    className: 'ctk-result',
-                    'aria-selected': false,
-                    onClick: () => openResult(item.sessionId)
-                  },
-                  h('span', { className: 'ctk-result-title' }, titleOf(item.sessionId)),
-                  h('span', { className: 'ctk-result-snippet' }, item.snippet),
-                  h(
-                    'span',
-                    { className: 'ctk-result-meta' },
-                    archived.has(item.sessionId) ? t('search.archived') : item.sessionId
-                  )
-                )
-              )
-            )
-          : null
       );
     }
 
@@ -1073,23 +923,22 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Dock wrapper: applies a pending resend and renders the search bar beneath it.
+     * Dock entry: the (invisible) resend plumbing for "edit and resend".
+     *
+     * The dock is the only seat that receives both the Session identity and the
+     * composer's `input`/`inputActions`, so the pending resend is applied here;
+     * it renders nothing, and therefore occupies no space above the composer.
      *
      * @param props - the dock owner props plus the injected services.
-     * @returns the dock contents.
+     * @returns `null` in every case.
      */
     function ComposerDock(props) {
-      return h(
-        React.Fragment,
-        null,
-        h(PendingResend, {
-          sessionId: props.sessionId,
-          input: props.input,
-          inputActions: props.inputActions,
-          t: props.t
-        }),
-        h(GlobalSearchBar, props)
-      );
+      return h(PendingResend, {
+        sessionId: props.sessionId,
+        input: props.input,
+        inputActions: props.inputActions,
+        t: props.t
+      });
     }
 
     // ───────────────────────────────────────────────────────────────────────
@@ -1118,7 +967,8 @@ window.__ModuleLoader__.load({
         () =>
           ctx.locale.register(NS, {
             zh: {
-              'menu.copyMarkdown': '复制为 Markdown',
+              'menu.copyMarkdown': '复制全文为 Markdown',
+              'menu.copyMarkdownBrief': '复制为 Markdown（不含思考与工具）',
               'menu.copyMarkdown.busy': '正在导出…',
               'menu.copyLink': '复制对话链接',
               'turn.label': '第 {n} 轮',
@@ -1136,18 +986,11 @@ window.__ModuleLoader__.load({
               'confirm.deleteTurn.desc': '第 {n} 轮及其之后的全部对话都不会出现在新会话里。',
               'confirm.deleteTurn.action': '分叉并删除',
               'confirm.note': 'DSH 的会话日志是只追加、不可改写的，因此这里的分叉只创建新会话，原会话保持原样，可随时回退。',
-              'search.placeholder': '搜索全部对话…',
-              'search.hint': 'Enter 打开首条',
-              'search.results': '搜索结果',
-              'search.searching': '搜索中…',
-              'search.empty': '没有匹配的对话',
-              'search.failed': '搜索失败：{detail}',
-              'search.archived': '已归档',
               'toast.linkCopied': '对话链接已复制',
               'toast.markdownCopied': '已复制 Markdown（{n} 字符）',
               'toast.exportFailed': '导出失败：{detail}',
-              'toast.openFailed': '打开会话失败：{detail}',
               'toast.copyFailed': '复制失败，请重试',
+              'toast.copyFailedDetail': '复制失败：{detail}',
               'toast.turnCopied': '本轮对话已复制',
               'toast.branchCreated': '已在新分支中打开',
               'toast.branchResent': '已在新分支中重新发送',
@@ -1159,7 +1002,8 @@ window.__ModuleLoader__.load({
               'working': '处理中…'
             },
             en: {
-              'menu.copyMarkdown': 'Copy as Markdown',
+              'menu.copyMarkdown': 'Copy the full conversation as Markdown',
+              'menu.copyMarkdownBrief': 'Copy as Markdown (without thinking and tools)',
               'menu.copyMarkdown.busy': 'Exporting…',
               'menu.copyLink': 'Copy conversation link',
               'turn.label': 'Turn {n}',
@@ -1177,18 +1021,11 @@ window.__ModuleLoader__.load({
               'confirm.deleteTurn.desc': 'Turn {n} and every later turn are omitted from the new Session.',
               'confirm.deleteTurn.action': 'Branch and delete',
               'confirm.note': 'DSH session logs are append-only and never rewritten, so this branch only creates a new Session. The original stays exactly as it is and remains available.',
-              'search.placeholder': 'Search every conversation…',
-              'search.hint': 'Enter opens the first hit',
-              'search.results': 'Search results',
-              'search.searching': 'Searching…',
-              'search.empty': 'No conversation matches',
-              'search.failed': 'Search failed: {detail}',
-              'search.archived': 'archived',
               'toast.linkCopied': 'Conversation link copied',
               'toast.markdownCopied': 'Markdown copied ({n} characters)',
               'toast.exportFailed': 'Export failed: {detail}',
-              'toast.openFailed': 'Could not open the session: {detail}',
               'toast.copyFailed': 'Copy failed; try again',
+              'toast.copyFailedDetail': 'Copy failed: {detail}',
               'toast.turnCopied': 'Turn copied',
               'toast.branchCreated': 'Opened in a new branch',
               'toast.branchResent': 'Resent in a new branch',
@@ -1208,7 +1045,6 @@ window.__ModuleLoader__.load({
       /** Services handed to every component through each registration's `inject`. */
       const services = {
         turnCache,
-        search: (query, signal) => ctx.sessions.search(query, signal),
         openSession: (sessionId) => ctx.uiWorkspace.openSession(sessionId),
         rememberLink: (sessionId, link) => {
           lastLink.set(sessionId, link);
@@ -1219,11 +1055,14 @@ window.__ModuleLoader__.load({
          * @param sessionId - the Session to export.
          * @returns a structured outcome the caller localizes.
          */
-        async exportMarkdown(sessionId) {
+        async exportMarkdown(sessionId, options = {}) {
           try {
-            const markdown = await fetchTranscript(sessionId, { reasoning: false, tools: false });
-            const ok = await writeClipboard(markdown);
-            return ok ? { ok: true, chars: markdown.length } : { ok: false, code: 'copy' };
+            const markdown = await fetchTranscript(sessionId, {
+              reasoning: options.full !== false,
+              tools: options.full !== false
+            });
+            const copied = await writeClipboard(markdown);
+            return copied.ok ? { ok: true, chars: markdown.length } : { ok: false, code: 'copy', detail: copied.reason };
           } catch (error) {
             return { ok: false, code: 'export', detail: describeError(error) };
           }
@@ -1256,6 +1095,16 @@ window.__ModuleLoader__.load({
             inject: () => services
           },
           CopyMarkdownMenuItem
+        );
+        yield ctx.slots.register(
+          {
+            name: 'sidebar.workspaces.session.menu.item',
+            id: 'conversation-toolkit.copy-markdown-brief',
+            order: 505,
+            locale: NS,
+            inject: () => services
+          },
+          CopyMarkdownBriefMenuItem
         );
         yield ctx.slots.register(
           {
@@ -1309,7 +1158,7 @@ window.__ModuleLoader__.load({
         ctx.slots.register(
           {
             name: 'conversation.input.dock',
-            id: 'conversation-toolkit.global-search',
+            id: 'conversation-toolkit.resend',
             order: -10,
             locale: NS,
             inject: () => services
@@ -1330,6 +1179,7 @@ window.__ModuleLoader__.load({
           ToolkitOverlay
         )
       );
+
 
       // Resolve a deep link produced by "Copy conversation link": the Web shell
       // has no router and never touches the document URL, so a query parameter

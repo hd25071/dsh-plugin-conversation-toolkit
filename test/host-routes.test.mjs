@@ -33,14 +33,21 @@ const HEADER = { type: 'session', version: 4, id: 'session-x', createdAt: 1, cwd
 /**
  * Build a context whose connection service records routes.
  *
+ * The object is a Proxy that reproduces Cordis's resolution rule: a property
+ * that is not an own member throws `cannot get property "…" without inject`.
+ * A sibling-provided service is therefore reachable ONLY through `ctx.get`,
+ * which is what the plugin must use — if the code regresses to plain property
+ * access, these tests fail with a 503 instead of silently passing.
+ *
  * @param options - test seams.
  * @param options.sessionQuery - the query service, or `undefined` to simulate a profile without one.
  * @returns the context, the registered routes, and a caller.
  */
 function fakeContext(options = {}) {
   const routes = new Map();
-  const ctx = {
-    get() {
+  const base = {
+    get(name) {
+      if (name === 'sessionQuery') return options.sessionQuery;
       return undefined;
     },
     connection: {
@@ -50,9 +57,14 @@ function fakeContext(options = {}) {
           routes.set(route.path, route);
         }
       }
-    },
-    sessionQuery: options.sessionQuery
+    }
   };
+  const ctx = new Proxy(base, {
+    get(target, prop, receiver) {
+      if (typeof prop === 'symbol' || prop in target) return Reflect.get(target, prop, receiver);
+      throw new Error(`cannot get property "${String(prop)}" without inject`);
+    }
+  });
   return {
     ctx,
     routes,
@@ -129,14 +141,26 @@ test('the transcript route serves Markdown with its title header', async () => {
   assert.match(markdown, /^# Greeting/);
   assert.match(markdown, /Hello/);
   assert.match(markdown, /Hi there/);
-  assert.doesNotMatch(markdown, /hmm/, 'reasoning is excluded by default');
+  // The default export is the whole record, reasoning included.
+  assert.match(markdown, /hmm/);
+  assert.match(markdown, /^## Turn 1$/m);
 });
 
-test('the transcript route honours the render switches', async () => {
+test('a sibling-provided service is reached through ctx.get, not property access', async () => {
+  // `fakeContext` throws on unknown property access exactly as Cordis does, so
+  // a 200 here proves the route used the documented reader.
   const harness = fakeContext({ sessionQuery: fakeQuery() });
   apply(harness.ctx);
-  const markdown = await (await harness.call(TRANSCRIPT_PATH, 'sessionId=session-x&reasoning=1')).text();
-  assert.match(markdown, /hmm/);
+  const response = await harness.call(TRANSCRIPT_PATH, 'sessionId=session-x');
+  assert.equal(response.status, 200);
+});
+
+test('the transcript route can drop reasoning and tools', async () => {
+  const harness = fakeContext({ sessionQuery: fakeQuery() });
+  apply(harness.ctx);
+  const markdown = await (await harness.call(TRANSCRIPT_PATH, 'sessionId=session-x&reasoning=0&tools=0')).text();
+  assert.match(markdown, /Hi there/);
+  assert.doesNotMatch(markdown, /hmm/);
 });
 
 test('the transcript route can answer JSON for embedding', async () => {

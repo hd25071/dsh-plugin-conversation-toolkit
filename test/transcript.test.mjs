@@ -90,30 +90,41 @@ test('titleFromEvents folds the most recent title', () => {
   assert.equal(titleFromEvents([]), undefined);
 });
 
-test('renderTranscript hides reasoning and tools by default', () => {
+test('renderTranscript covers the whole conversation by default', () => {
   const markdown = renderTranscript({ header: HEADER, events: EVENTS, title: 'A test conversation' });
   assert.match(markdown, /^# A test conversation$/m);
-  assert.match(markdown, /## User\n\nFirst question/);
-  assert.match(markdown, /## Assistant\n\nFirst answer/);
+  assert.match(markdown, /### User\n\nFirst question/);
+  assert.match(markdown, /### Assistant\n\nFirst answer/);
   assert.match(markdown, /Second answer/);
-  assert.doesNotMatch(markdown, /Let me think about it\./);
-  assert.doesNotMatch(markdown, /file body/);
+  // Reasoning and tool traffic are part of the record by default.
+  assert.match(markdown, /Let me think about it\./);
+  assert.match(markdown, /I should read the file\./);
+  assert.match(markdown, /Tool call · <code>read<\/code>/);
+  assert.match(markdown, /"file_path": "a\.txt"/);
+  assert.match(markdown, /file body/);
+  // Turn sections, in order.
+  assert.match(markdown, /^## Turn 1$/m);
+  assert.match(markdown, /^## Turn 2$/m);
+  assert.ok(markdown.indexOf('## Turn 1') < markdown.indexOf('## Turn 2'));
+  assert.match(markdown, /- \*\*Turns\*\*: 2/);
   assert.match(markdown, /`session-test-0001`/);
   assert.ok(markdown.endsWith('\n'));
   assert.ok(!markdown.endsWith('\n\n'));
 });
 
-test('renderTranscript includes reasoning and tools on request', () => {
+test('renderTranscript drops reasoning and tools for a compact export', () => {
   const markdown = renderTranscript({
     header: HEADER,
     events: EVENTS,
     title: 'A test conversation',
-    options: { reasoning: true, tools: true }
+    options: { reasoning: false, tools: false }
   });
-  assert.match(markdown, /<summary>Thinking<\/summary>/);
-  assert.match(markdown, /Let me think about it\./);
-  assert.match(markdown, /Tool call · `read`/);
-  assert.match(markdown, /file body/);
+  assert.match(markdown, /First question/);
+  assert.match(markdown, /First answer/);
+  assert.doesNotMatch(markdown, /Let me think about it\./);
+  assert.doesNotMatch(markdown, /I should read the file\./);
+  assert.doesNotMatch(markdown, /Tool call ·/);
+  assert.doesNotMatch(markdown, /file body/);
 });
 
 test('analyzeTurns reports both turns with their cut points', () => {
@@ -205,4 +216,24 @@ test('a real stored Session log folds without throwing', (t) => {
   }
   const withUser = turns.filter((turn) => turn.user !== null).length;
   assert.ok(withUser > 0, 'at least one turn carries user text');
+
+  // The default export is the whole record: every turn gets a section, and the
+  // document is at least as long as the conversation text it contains.
+  const textBytes = events.reduce((total, event) => {
+    const data = event.data ?? {};
+    return total + JSON.stringify(data.content ?? data.blocks ?? data.message ?? '').length;
+  }, 0);
+  assert.ok(markdown.length > 200, `the transcript is substantial (${String(markdown.length)} chars)`);
+  assert.ok(markdown.length > textBytes / 8, 'the transcript is not a stub');
+  const headings = markdown.match(/^## Turn \d+$/gm) ?? [];
+  assert.equal(headings.length, turns.length, 'one heading per folded turn');
+
+  // The compact export must be strictly smaller and must drop the
+  // <details> disclosures the full export keeps.
+  const compact = renderTranscript({ header, events, title: titleFromEvents(events), options: { reasoning: false, tools: false } });
+  assert.ok(compact.length < markdown.length, 'the compact export is smaller');
+  assert.ok(
+    (markdown.match(/<details>/g) ?? []).length >= (compact.match(/<details>/g) ?? []).length,
+    'the full export keeps at least as many disclosures'
+  );
 });

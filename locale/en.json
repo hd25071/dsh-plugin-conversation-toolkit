@@ -1,4 +1,4 @@
 {
   "title": "Conversation Toolkit",
-  "description": "Copy a conversation as Markdown, copy a deep link that reopens it, edit a user message and resend it, branch away a turn or its reasoning, and search every conversation from above the composer."
+  "description": "Copy a whole conversation as Markdown, copy a deep link that reopens it, edit a user message and resend it, and branch a turn or its reasoning away."
 }
