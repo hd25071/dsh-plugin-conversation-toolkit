@@ -1,0 +1,65 @@
+{
+  "name": "dsh-plugin-conversation-toolkit",
+  "version": "0.1.0",
+  "description": "Conversation toolkit for DeepSeek Harness: copy a conversation as Markdown, copy a deep link that reopens it, edit a user message and resend it, drop a turn or its reasoning, and search every conversation from above the composer.",
+  "type": "module",
+  "license": "MIT",
+  "author": "hd25071",
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "conversation",
+    "markdown",
+    "deep-link",
+    "search"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hd25071/dsh-plugin-conversation-toolkit.git"
+  },
+  "homepage": "https://github.com/hd25071/dsh-plugin-conversation-toolkit#readme",
+  "bugs": {
+    "url": "https://github.com/hd25071/dsh-plugin-conversation-toolkit/issues"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./client/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client",
+    "locale",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "check": "node --check client/client.js && node --test test/"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": false,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-chat"
+      ]
+    }
+  }
+}

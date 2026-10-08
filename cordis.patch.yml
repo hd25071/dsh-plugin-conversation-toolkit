@@ -1,0 +1,8 @@
+# Bundle patch: mount the Conversation Toolkit into a DSH profile.
+#
+# One row. The Host half registers the two read-only Fetch routes the Client
+# half calls; the Client half is discovered automatically from this package's
+# `dsh.client` declaration and `exports["./client"]`, so it needs no row here.
+- insert:
+    - id: conversation-toolkit
+      name: 'dsh-plugin-conversation-toolkit'

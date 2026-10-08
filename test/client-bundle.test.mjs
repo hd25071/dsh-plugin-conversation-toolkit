@@ -1,0 +1,338 @@
+/**
+ * Client-bundle contract tests.
+ *
+ * The browser half cannot be type-checked and cannot be rendered outside the
+ * Harness, so this suite exercises the three things that actually decide whether
+ * it activates at all:
+ *
+ * 1. the bundle parses and registers exactly the factory id the module loader
+ *    demands (it must equal the package name, or every page load throws
+ *    `bundle … loaded without registering "<id>"`),
+ * 2. `apply(ctx)` completes against the real service names and registers into
+ *    declared slots with the ids and orders this plugin claims, and
+ * 3. each registered component is callable with the props its slot documents.
+ */
+
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const BUNDLE = path.join(HERE, '..', 'client', 'client.js');
+const MANIFEST = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8'));
+const SOURCE = fs.readFileSync(BUNDLE, 'utf8');
+
+/**
+ * Build the minimal React surface the bundle touches at definition time.
+ *
+ * Hooks are inert, but `useState` honours a functional initial value and
+ * `useCallback`/`useMemo` return the callback result, so calling a component
+ * once produces the same element tree a first render would.
+ *
+ * @returns the shim.
+ */
+function reactShim() {
+  const Fragment = Symbol('Fragment');
+  return {
+    Fragment,
+    createElement(type, props, ...children) {
+      return { type, props: { ...(props ?? {}), children: children.length > 1 ? children : children[0] } };
+    },
+    useState(initial) {
+      return [typeof initial === 'function' ? initial() : initial, () => {}];
+    },
+    useEffect() {},
+    useLayoutEffect() {},
+    useCallback(fn) {
+      return fn;
+    },
+    useMemo(fn) {
+      return fn();
+    },
+    useRef(value) {
+      return { current: value };
+    },
+    useSyncExternalStore(getSnapshot) {
+      return getSnapshot();
+    }
+  };
+}
+
+/**
+ * Materialize the bundle's factory.
+ *
+ * @param options - test seams.
+ * @param options.href - the document URL the deep-link reader sees.
+ * @returns the module exports plus the recorded calls.
+ */
+function materialize(options = {}) {
+  const registered = [];
+  const styles = [];
+  const moduleLoader = {
+    load(record) {
+      assert.equal(typeof record.id, 'string');
+      assert.equal(typeof record.factory, 'function');
+      moduleLoader.registered = record;
+    }
+  };
+  const React = reactShim();
+  const documentStub = {
+    head: { appendChild: (node) => styles.push(node) },
+    body: { appendChild() {}, removeChild() {} },
+    createElement: () => ({ style: {}, dataset: {}, remove() {}, setAttribute() {}, select() {} }),
+    querySelector: () => null,
+    execCommand: () => true
+  };
+  const windowStub = { __ModuleLoader__: moduleLoader, location: { href: options.href ?? 'http://127.0.0.1:19387/' } };
+  const navigatorStub = { clipboard: { writeText: async () => {} } };
+
+  const run = new Function('window', 'document', 'navigator', 'fetch', SOURCE);
+  run(windowStub, documentStub, navigatorStub, options.fetch ?? (async () => new Response('', { status: 200 })));
+
+  const record = moduleLoader.registered;
+  assert.ok(record !== undefined, 'the bundle registers a factory');
+  const exports = record.factory((specifier) => {
+    assert.equal(specifier, 'react', `the bundle requires only react, saw ${specifier}`);
+    return React;
+  });
+  return { record, exports, registered, styles, React };
+}
+
+/**
+ * Build a Cordis-shaped client context recording every registration.
+ *
+ * @param options - test seams.
+ * @returns the context and the recorded state.
+ */
+function fakeContext(options = {}) {
+  const state = {
+    registrations: [],
+    injections: [],
+    locales: [],
+    effects: [],
+    opened: [],
+    forkCalls: [],
+    searches: [],
+    timers: []
+  };
+  const ctx = {
+    effect(fn, label) {
+      const dispose = fn();
+      state.effects.push({ label, dispose });
+      return () => {};
+    },
+    locale: {
+      register(ns, dicts) {
+        state.locales.push({ ns, dicts });
+        return () => {};
+      }
+    },
+    slots: {
+      inject(name, callback) {
+        state.injections.push(name);
+        const produced = callback();
+        // The shipped plugins use generator callbacks to yield several
+        // registrations; each `register` call already recorded itself.
+        if (produced !== null && typeof produced === 'object' && typeof produced[Symbol.iterator] === 'function' && typeof produced.next === 'function') {
+          for (const entry of produced) void entry;
+        }
+        return () => {};
+      },
+      register(definition, component) {
+        const entry = { definition, component };
+        state.registrations.push(entry);
+        return entry;
+      }
+    },
+    sessions: {
+      async search(query, signal) {
+        state.searches.push({ query, signal });
+        return { ok: true, value: { items: [{ sessionId: 'session-a', snippet: 'hit' }], hasMore: false } };
+      },
+      async fork(opts) {
+        state.forkCalls.push(opts);
+        return 'session-child';
+      }
+    },
+    uiWorkspace: {
+      openSession(target) {
+        state.opened.push(target);
+      }
+    },
+    timeout(fn, delay) {
+      state.timers.push({ fn, delay });
+      return () => {};
+    }
+  };
+  void options;
+  return { ctx, state };
+}
+
+test('the bundle registers the factory id the module loader requires', () => {
+  const { record } = materialize();
+  assert.equal(record.id, MANIFEST.name, 'the factory id equals the package name');
+});
+
+test('the bundle requires no Harness client package', () => {
+  const requires = [...SOURCE.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map((match) => match[1]);
+  const unique = [...new Set(requires)];
+  assert.deepEqual(unique, ['react'], `only react may be required, saw: ${unique.join(', ')}`);
+});
+
+test('module exports expose the plugin face', () => {
+  const { exports } = materialize();
+  assert.equal(typeof exports.apply, 'function');
+  assert.ok(Array.isArray(exports.inject));
+  assert.deepEqual(exports.inject, ['slots', 'sessions', 'uiWorkspace', 'locale']);
+});
+
+test('apply() registers every claimed extension point', () => {
+  const { exports } = materialize();
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+
+  const summary = state.registrations.map((entry) => ({
+    slot: entry.definition.name,
+    id: entry.definition.id ?? entry.definition.key,
+    order: entry.definition.order
+  }));
+
+  assert.deepEqual(summary, [
+    { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.copy-markdown', order: 500 },
+    { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.copy-link', order: 510 },
+    { slot: 'sidebar.workspaces.session.row.action', id: 'conversation-toolkit.copy-markdown', order: 150 },
+    { slot: 'sidebar.workspaces.session.row.action', id: 'conversation-toolkit.copy-link', order: 160 },
+    { slot: 'conversation.chat.turnTail', id: 'conversation-toolkit.turn-actions', order: 300 },
+    { slot: 'conversation.input.dock', id: 'conversation-toolkit.global-search', order: -10 },
+    { slot: 'shell.overlay', id: 'conversation-toolkit.dialogs', order: 20 }
+  ]);
+
+  // Every id is namespaced, so no shipped entry can be shadowed by accident.
+  for (const entry of state.registrations) {
+    assert.match(String(entry.definition.id), /^conversation-toolkit\./);
+    assert.equal(entry.definition.locale, 'conversation-toolkit');
+    assert.equal(typeof entry.component, 'function');
+    assert.equal(typeof entry.definition.inject, 'function');
+  }
+});
+
+test('apply() declares both locale dictionaries with identical key sets', () => {
+  const { exports } = materialize();
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  assert.equal(state.locales.length, 1);
+  const [locale] = state.locales;
+  assert.equal(locale.ns, 'conversation-toolkit');
+  assert.deepEqual(Object.keys(locale.dicts).sort(), ['en', 'zh']);
+  assert.deepEqual(Object.keys(locale.dicts.zh).sort(), Object.keys(locale.dicts.en).sort());
+});
+
+test('the search bar is placed above the composer card', () => {
+  const { exports } = materialize();
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const dock = state.registrations.find((entry) => entry.definition.name === 'conversation.input.dock');
+  assert.ok(dock !== undefined, 'the search bar registers into conversation.input.dock');
+  // The shipped entries occupy 0 (todo) and 20 (queue); a global bar leads them.
+  assert.ok(dock.definition.order < 0, 'the search bar sorts above every shipped dock entry');
+});
+
+test('registered components render with their documented props', async () => {
+  const { exports } = materialize();
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+
+  const services = state.registrations[0].definition.inject('session-a');
+  assert.equal(typeof services.exportMarkdown, 'function');
+  assert.equal(typeof services.forkAndOpen, 'function');
+  assert.equal(typeof services.search, 'function');
+  assert.equal(typeof services.openSession, 'function');
+
+  const t = (key, params) => (params === undefined ? key : `${key}:${Object.values(params).join(',')}`);
+  const useMenuOpenState = () => [false, () => {}];
+  const useSessions = () => ({ byId: { 'session-a': { displayTitle: 'Alpha' } }, ids: ['session-a'] });
+  const useWorkspaces = () => ({ archivedSessionIds: [], pinnedSessionIds: [] });
+  const useSessionStatus = () => undefined;
+
+  for (const entry of state.registrations) {
+    const props = {
+      sessionId: 'session-a',
+      displayTitle: 'Alpha',
+      seq: 6,
+      turn: { turn: 1 },
+      messageId: 'm1',
+      input: { draft: '' },
+      inputActions: { setDraft() {}, submit() {} },
+      services,
+      useMenuOpenState,
+      useSessions,
+      useWorkspaces,
+      useSessionStatus,
+      t
+    };
+    entry.component(props);
+  }
+});
+
+test('copying Markdown fetches the transcript route and writes the clipboard', async () => {
+  const writes = [];
+  const calls = [];
+  const { exports } = materialize({
+    fetch: async (url) => {
+      calls.push(String(url));
+      return new Response('# Title\n\nbody\n', { status: 200, headers: { 'content-type': 'text/markdown' } });
+    }
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+  const result = await services.exportMarkdown('session-a');
+  assert.deepEqual(result, { ok: true, chars: '# Title\n\nbody\n'.length });
+  assert.match(calls[0], /^api\/conversation-toolkit\/transcript\?sessionId=session-a$/);
+  void writes;
+});
+
+test('a failing transcript read is reported, never thrown', async () => {
+  const { exports } = materialize({
+    fetch: async () => new Response(JSON.stringify({ ok: false, error: { code: 'session-not-found', message: 'gone' } }), { status: 404 })
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('missing');
+  const result = await services.exportMarkdown('missing');
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'export');
+  assert.equal(result.detail, 'gone');
+});
+
+test('the deep-link query parameter opens its Session without a router', () => {
+  const { exports } = materialize({ href: 'http://127.0.0.1:19387/?dsh-session=session-42' });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  assert.equal(state.opened[0], 'session-42');
+  // The shell restores its own selection after boot, so the open is repeated.
+  assert.ok(state.effects.some((effect) => effect.label === 'conversation-toolkit: deep link'));
+});
+
+test('forkAndOpen cuts at the requested inclusive seq and queues the resend text', async () => {
+  const { exports } = materialize();
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+
+  const childId = await services.forkAndOpen('session-a', 6, 'edited text');
+  assert.equal(childId, 'session-child');
+  assert.deepEqual(state.forkCalls, [{ sessionId: 'session-a', atSeq: 6, increaseTitle: true }]);
+  assert.deepEqual(state.opened, ['session-child']);
+});
+
+test('forkAndOpen refuses a missing cut point instead of forking everything', async () => {
+  const { exports } = materialize();
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+  await assert.rejects(() => services.forkAndOpen('session-a', null, null), /cut point/);
+  assert.equal(state.forkCalls.length, 0);
+});
