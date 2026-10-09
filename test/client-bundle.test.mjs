@@ -78,10 +78,25 @@ function materialize(options = {}) {
     }
   };
   const React = reactShim();
+  /** Anchors the bundle created and clicked, i.e. the downloads it requested. */
+  const downloads = [];
   const documentStub = {
     head: { appendChild: (node) => styles.push(node) },
     body: { appendChild() {}, removeChild() {} },
-    createElement: () => ({ style: {}, dataset: {}, remove() {}, setAttribute() {}, select() {} }),
+    createElement: (tag) => {
+      const node = {
+        tag,
+        style: {},
+        dataset: {},
+        remove() {},
+        setAttribute() {},
+        select() {},
+        setSelectionRange() {},
+        focus() {}
+      };
+      node.click = () => downloads.push({ tag, download: node.download });
+      return node;
+    },
     querySelector: () => null,
     execCommand: () => true
   };
@@ -97,7 +112,7 @@ function materialize(options = {}) {
     assert.equal(specifier, 'react', `the bundle requires only react, saw ${specifier}`);
     return React;
   });
-  return { record, exports, registered, styles, React };
+  return { record, exports, registered, styles, React, downloads };
 }
 
 /**
@@ -202,6 +217,7 @@ test('apply() registers every claimed extension point', () => {
   assert.deepEqual(summary, [
     { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.copy-markdown', order: 500 },
     { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.copy-markdown-brief', order: 505 },
+    { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.download-markdown', order: 508 },
     { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.copy-link', order: 510 },
     { slot: 'sidebar.workspaces.session.row.action', id: 'conversation-toolkit.copy-markdown', order: 150 },
     { slot: 'sidebar.workspaces.session.row.action', id: 'conversation-toolkit.copy-link', order: 160 },
@@ -256,7 +272,7 @@ test('registered components render with their documented props', async () => {
   exports.apply(ctx);
 
   const services = state.registrations[0].definition.inject('session-a');
-  assert.deepEqual(Object.keys(services).sort(), ['exportMarkdown', 'forkAndOpen', 'openSession', 'rememberLink', 'turnCache']);
+  assert.deepEqual(Object.keys(services).sort(), ['downloadMarkdown', 'exportMarkdown', 'forkAndOpen', 'openSession', 'rememberLink', 'turnCache']);
   assert.equal(typeof services.exportMarkdown, 'function');
   assert.equal(typeof services.forkAndOpen, 'function');
   assert.equal(typeof services.openSession, 'function');
@@ -310,6 +326,43 @@ test('copying Markdown asks for the whole record and writes the clipboard', asyn
   assert.equal(brief.ok, true);
   assert.match(calls[1], /reasoning=0/);
   assert.match(calls[1], /tools=0/);
+});
+
+test('downloading saves a .md file named after the conversation', async () => {
+  const { exports, downloads } = materialize({
+    fetch: async () =>
+      new Response('# Title\n\nbody\n', {
+        status: 200,
+        headers: {
+          'content-type': 'text/markdown',
+          // The Host echoes the title so the file can be named without a second call.
+          'x-conversation-toolkit-title': encodeURIComponent('Deploy: hub / 2026')
+        }
+      })
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+
+  const result = await services.downloadMarkdown('session-abcdef12-3456', { full: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.chars, '# Title\n\nbody\n'.length);
+  assert.equal(downloads.length, 1);
+  // Path separators and colons must not survive into a filename.
+  assert.equal(downloads[0].download, 'Deploy_ hub _ 2026 abcdef12.md');
+  assert.equal(result.filename, downloads[0].download);
+});
+
+test('a download falls back to the Session id when the title is unusable', async () => {
+  const { exports, downloads } = materialize({
+    fetch: async () => new Response('# x\n', { status: 200, headers: { 'x-conversation-toolkit-title': encodeURIComponent('...') } })
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('s');
+  const result = await services.downloadMarkdown('session-abcdef12-3456', { full: true });
+  assert.equal(result.ok, true);
+  assert.equal(downloads[0].download, 'conversation abcdef12.md');
 });
 
 test('a clipboard refusal is reported with its reason', async () => {

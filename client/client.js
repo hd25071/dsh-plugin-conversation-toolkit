@@ -144,6 +144,13 @@ window.__ModuleLoader__.load({
     const IconClose = () =>
       strokeIcon([h('path', { key: 'a', d: 'm4 4 8 8M12 4l-8 8' })]);
 
+    const IconDownload = () =>
+      strokeIcon([
+        h('path', { key: 'a', d: 'M8 2.6v7.6' }),
+        h('path', { key: 'b', d: 'M4.9 7.2 8 10.3l3.1-3.1' }),
+        h('path', { key: 'c', d: 'M2.9 12.6v.8a1 1 0 0 0 1 1h8.2a1 1 0 0 0 1-1v-.8' })
+      ]);
+
     // ───────────────────────────────────────────────────────────────────────
     // Small observable store + clipboard/transport helpers
     // ───────────────────────────────────────────────────────────────────────
@@ -272,7 +279,7 @@ window.__ModuleLoader__.load({
      *
      * @param sessionId - the Session to export.
      * @param options - render switches.
-     * @returns the Markdown text.
+     * @returns the Markdown text and the Session title the Host echoed back.
      * @throws when the Host reports a business failure.
      */
     async function fetchTranscript(sessionId, options = {}) {
@@ -292,7 +299,65 @@ window.__ModuleLoader__.load({
         }
         throw new Error(detail);
       }
-      return await response.text();
+      const encodedTitle = response.headers.get('x-conversation-toolkit-title');
+      let title = sessionId;
+      if (encodedTitle !== null && encodedTitle !== '') {
+        try {
+          title = decodeURIComponent(encodedTitle);
+        } catch {
+          /* a malformed header must not fail the export */
+        }
+      }
+      return { text: await response.text(), title };
+    }
+
+    /**
+     * Build a safe `.md` filename for one conversation.
+     *
+     * @param title - the Session title.
+     * @param sessionId - the Session id, appended so two same-titled exports differ.
+     * @returns the filename.
+     */
+    function markdownFilename(title, sessionId) {
+      // Windows rejects a filename that ends in a dot or a space, and a title of
+      // "." or ".." would name a directory, so the stem is stripped of both ends.
+      const cleaned = String(title)
+        .replace(/[\\/:*?"<>|\u0000-\u001f\u007f]/g, '_')
+        .replace(/\s+/g, ' ')
+        .replace(/^[.\s]+|[.\s]+$/g, '')
+        .slice(0, 80)
+        .replace(/[.\s]+$/, '');
+      const stem = cleaned === '' ? 'conversation' : cleaned;
+      return `${stem} ${String(sessionId).replace(/^session-/, '').slice(0, 8)}.md`;
+    }
+
+    /**
+     * Save one Markdown document through a Blob download.
+     *
+     * This path never touches the clipboard, so it works regardless of secure
+     * context, focus, or how large the conversation is.
+     *
+     * @param filename - the suggested filename.
+     * @param text - the document.
+     * @returns whether the browser accepted the download.
+     */
+    function saveMarkdown(filename, text) {
+      try {
+        const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = filename;
+        anchor.style.display = 'none';
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+        return true;
+      } catch (error) {
+        console.error('[conversation-toolkit] download failed:', error);
+        return false;
+      }
     }
 
     /**
@@ -493,6 +558,44 @@ window.__ModuleLoader__.load({
 
     /** Menu row (order 505): copy only the user text and the answers. */
     const CopyMarkdownBriefMenuItem = copyMarkdownMenuItem({ full: false, labelKey: 'menu.copyMarkdownBrief' });
+
+    /**
+     * Sidebar menu row: save the conversation as a `.md` file.
+     *
+     * A long conversation exports to well over a megabyte, and a download never
+     * depends on the clipboard, the secure-context rules, or a paste target's
+     * size limits — so this is the action that always works.
+     *
+     * @param props - owner props plus the injected services.
+     * @returns the menu row.
+     */
+    function DownloadMarkdownMenuItem({ sessionId, services, useMenuOpenState, t }) {
+      const closeMenu = useMenuCloser(useMenuOpenState);
+      const [busy, setBusy] = React.useState(false);
+      const onSelect = React.useCallback(() => {
+        closeMenu();
+        setBusy(true);
+        services
+          .downloadMarkdown(sessionId, { full: true })
+          .then((result) => {
+            if (result.ok) {
+              notify(t('toast.markdownSaved', { name: result.filename }));
+              return;
+            }
+            notify(
+              result.code === 'download' ? t('toast.downloadFailed') : t('toast.exportFailed', { detail: result.detail ?? '' }),
+              'error'
+            );
+          })
+          .finally(() => setBusy(false));
+      }, [closeMenu, services, sessionId, t]);
+      return h(
+        'button',
+        { type: 'button', role: 'menuitem', className: 'ctk-menu-item', disabled: busy, onClick: onSelect },
+        h(IconDownload, null),
+        h('span', null, busy ? t('menu.copyMarkdown.busy') : t('menu.downloadMarkdown'))
+      );
+    }
 
     /**
      * Sidebar menu row: copy a deep link that reopens this conversation.
@@ -969,6 +1072,7 @@ window.__ModuleLoader__.load({
             zh: {
               'menu.copyMarkdown': '复制全文为 Markdown',
               'menu.copyMarkdownBrief': '复制为 Markdown（不含思考与工具）',
+              'menu.downloadMarkdown': '下载为 .md 文件',
               'menu.copyMarkdown.busy': '正在导出…',
               'menu.copyLink': '复制对话链接',
               'turn.label': '第 {n} 轮',
@@ -988,6 +1092,8 @@ window.__ModuleLoader__.load({
               'confirm.note': 'DSH 的会话日志是只追加、不可改写的，因此这里的分叉只创建新会话，原会话保持原样，可随时回退。',
               'toast.linkCopied': '对话链接已复制',
               'toast.markdownCopied': '已复制 Markdown（{n} 字符）',
+              'toast.markdownSaved': '已保存 {name}',
+              'toast.downloadFailed': '浏览器拒绝了这次下载',
               'toast.exportFailed': '导出失败：{detail}',
               'toast.copyFailed': '复制失败，请重试',
               'toast.copyFailedDetail': '复制失败：{detail}',
@@ -1004,6 +1110,7 @@ window.__ModuleLoader__.load({
             en: {
               'menu.copyMarkdown': 'Copy the full conversation as Markdown',
               'menu.copyMarkdownBrief': 'Copy as Markdown (without thinking and tools)',
+              'menu.downloadMarkdown': 'Download as a .md file',
               'menu.copyMarkdown.busy': 'Exporting…',
               'menu.copyLink': 'Copy conversation link',
               'turn.label': 'Turn {n}',
@@ -1023,6 +1130,8 @@ window.__ModuleLoader__.load({
               'confirm.note': 'DSH session logs are append-only and never rewritten, so this branch only creates a new Session. The original stays exactly as it is and remains available.',
               'toast.linkCopied': 'Conversation link copied',
               'toast.markdownCopied': 'Markdown copied ({n} characters)',
+              'toast.markdownSaved': 'Saved {name}',
+              'toast.downloadFailed': 'The browser refused the download',
               'toast.exportFailed': 'Export failed: {detail}',
               'toast.copyFailed': 'Copy failed; try again',
               'toast.copyFailedDetail': 'Copy failed: {detail}',
@@ -1057,12 +1166,31 @@ window.__ModuleLoader__.load({
          */
         async exportMarkdown(sessionId, options = {}) {
           try {
-            const markdown = await fetchTranscript(sessionId, {
+            const { text } = await fetchTranscript(sessionId, {
               reasoning: options.full !== false,
               tools: options.full !== false
             });
-            const copied = await writeClipboard(markdown);
-            return copied.ok ? { ok: true, chars: markdown.length } : { ok: false, code: 'copy', detail: copied.reason };
+            const copied = await writeClipboard(text);
+            return copied.ok ? { ok: true, chars: text.length } : { ok: false, code: 'copy', detail: copied.reason };
+          } catch (error) {
+            return { ok: false, code: 'export', detail: describeError(error) };
+          }
+        },
+        /**
+         * Export one Session as Markdown and save it as a file.
+         *
+         * @param sessionId - the Session to export.
+         * @param options - render switches.
+         * @returns a structured outcome the caller localizes.
+         */
+        async downloadMarkdown(sessionId, options = {}) {
+          try {
+            const { text, title } = await fetchTranscript(sessionId, {
+              reasoning: options.full !== false,
+              tools: options.full !== false
+            });
+            const filename = markdownFilename(title, sessionId);
+            return saveMarkdown(filename, text) ? { ok: true, chars: text.length, filename } : { ok: false, code: 'download' };
           } catch (error) {
             return { ok: false, code: 'export', detail: describeError(error) };
           }
@@ -1105,6 +1233,16 @@ window.__ModuleLoader__.load({
             inject: () => services
           },
           CopyMarkdownBriefMenuItem
+        );
+        yield ctx.slots.register(
+          {
+            name: 'sidebar.workspaces.session.menu.item',
+            id: 'conversation-toolkit.download-markdown',
+            order: 508,
+            locale: NS,
+            inject: () => services
+          },
+          DownloadMarkdownMenuItem
         );
         yield ctx.slots.register(
           {
@@ -1179,6 +1317,7 @@ window.__ModuleLoader__.load({
           ToolkitOverlay
         )
       );
+
 
 
       // Resolve a deep link produced by "Copy conversation link": the Web shell
