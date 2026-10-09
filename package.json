@@ -44,8 +44,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test test/",
-    "check": "node --check client/client.js && node --test test/"
+    "test": "node --test test/**/*.test.mjs",
+    "check": "node --check client/client.js && node --test test/**/*.test.mjs"
   },
   "dsh": {
     "bundle": {
