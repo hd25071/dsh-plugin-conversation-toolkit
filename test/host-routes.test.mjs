@@ -141,8 +141,9 @@ test('the transcript route serves Markdown with its title header', async () => {
   assert.match(markdown, /^# Greeting/);
   assert.match(markdown, /Hello/);
   assert.match(markdown, /Hi there/);
-  // The default export is the whole record, reasoning included.
-  assert.match(markdown, /hmm/);
+  // The default export is the narrow one: thinking is NOT included unless asked.
+  assert.doesNotMatch(markdown, /hmm/);
+  assert.match(markdown, /- \*\*Export\*\*: standard/);
   assert.match(markdown, /^## Turn 1$/m);
 });
 
@@ -155,7 +156,25 @@ test('a sibling-provided service is reached through ctx.get, not property access
   assert.equal(response.status, 200);
 });
 
-test('the transcript route can drop reasoning and tools', async () => {
+test('the transcript route honours the export mode', async () => {
+  const harness = fakeContext({ sessionQuery: fakeQuery() });
+  apply(harness.ctx);
+
+  const full = await (await harness.call(TRANSCRIPT_PATH, 'sessionId=session-x&mode=full')).text();
+  assert.match(full, /hmm/);
+  assert.match(full, /\[!WARNING\]/);
+
+  const brief = await (await harness.call(TRANSCRIPT_PATH, 'sessionId=session-x&mode=brief')).text();
+  assert.match(brief, /Hi there/);
+  assert.doesNotMatch(brief, /hmm/);
+
+  // An unknown mode must land on the narrow default, never on full.
+  const bogus = await (await harness.call(TRANSCRIPT_PATH, 'sessionId=session-x&mode=nope')).text();
+  assert.doesNotMatch(bogus, /hmm/);
+  assert.match(bogus, /- \*\*Export\*\*: standard/);
+});
+
+test('the transcript route still accepts the legacy switches', async () => {
   const harness = fakeContext({ sessionQuery: fakeQuery() });
   apply(harness.ctx);
   const markdown = await (await harness.call(TRANSCRIPT_PATH, 'sessionId=session-x&reasoning=0&tools=0')).text();

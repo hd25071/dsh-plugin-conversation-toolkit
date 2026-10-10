@@ -98,10 +98,10 @@ function materialize(options = {}) {
       return node;
     },
     querySelector: () => null,
-    execCommand: () => true
+    execCommand: () => (options.execCommand === undefined ? true : options.execCommand)
   };
   const windowStub = { __ModuleLoader__: moduleLoader, location: { href: options.href ?? 'http://127.0.0.1:19387/' } };
-  const navigatorStub = { clipboard: { writeText: async () => {} } };
+  const navigatorStub = { clipboard: options.clipboard ?? { writeText: async () => {} } };
 
   const run = new Function('window', 'document', 'navigator', 'fetch', SOURCE);
   run(windowStub, documentStub, navigatorStub, options.fetch ?? (async () => new Response('', { status: 200 })));
@@ -216,9 +216,10 @@ test('apply() registers every claimed extension point', () => {
 
   assert.deepEqual(summary, [
     { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.copy-markdown', order: 500 },
-    { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.copy-markdown-brief', order: 505 },
-    { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.download-markdown', order: 508 },
-    { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.copy-link', order: 510 },
+    { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.copy-markdown-full', order: 505 },
+    { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.copy-markdown-brief', order: 510 },
+    { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.download-markdown', order: 515 },
+    { slot: 'sidebar.workspaces.session.menu.item', id: 'conversation-toolkit.copy-link', order: 520 },
     { slot: 'sidebar.workspaces.session.row.action', id: 'conversation-toolkit.copy-markdown', order: 150 },
     { slot: 'sidebar.workspaces.session.row.action', id: 'conversation-toolkit.copy-link', order: 160 },
     { slot: 'conversation.chat.turnTail', id: 'conversation-toolkit.turn-actions', order: 300 },
@@ -272,7 +273,17 @@ test('registered components render with their documented props', async () => {
   exports.apply(ctx);
 
   const services = state.registrations[0].definition.inject('session-a');
-  assert.deepEqual(Object.keys(services).sort(), ['downloadMarkdown', 'exportMarkdown', 'forkAndOpen', 'openSession', 'rememberLink', 'turnCache']);
+  assert.deepEqual(Object.keys(services).sort(), [
+    'copyText',
+    'downloadMarkdown',
+    'exportMarkdown',
+    'forkAndOpen',
+    'openSession',
+    'prefetch',
+    'rememberLink',
+    'saveText',
+    'turnCache'
+  ]);
   assert.equal(typeof services.exportMarkdown, 'function');
   assert.equal(typeof services.forkAndOpen, 'function');
   assert.equal(typeof services.openSession, 'function');
@@ -303,7 +314,7 @@ test('registered components render with their documented props', async () => {
   }
 });
 
-test('copying Markdown asks for the whole record and writes the clipboard', async () => {
+test('copying Markdown asks for the requested mode and writes the clipboard', async () => {
   const calls = [];
   const { exports } = materialize({
     fetch: async (url) => {
@@ -315,17 +326,99 @@ test('copying Markdown asks for the whole record and writes the clipboard', asyn
   exports.apply(ctx);
   const services = state.registrations[0].definition.inject('session-a');
 
-  const full = await services.exportMarkdown('session-a', { full: true });
-  assert.deepEqual(full, { ok: true, chars: '# Title\n\nbody\n'.length });
+  const full = await services.exportMarkdown('session-a', { mode: 'full' });
+  assert.deepEqual(full, { ok: true, chars: '# Title\n\nbody\n'.length, mode: 'full' });
   assert.match(calls[0], /^api\/conversation-toolkit\/transcript\?/);
   assert.match(calls[0], /sessionId=session-a/);
-  assert.match(calls[0], /reasoning=1/);
-  assert.match(calls[0], /tools=1/);
+  assert.match(calls[0], /mode=full/);
 
-  const brief = await services.exportMarkdown('session-a', { full: false });
+  const brief = await services.exportMarkdown('session-a', { mode: 'brief' });
   assert.equal(brief.ok, true);
-  assert.match(calls[1], /reasoning=0/);
-  assert.match(calls[1], /tools=0/);
+  assert.match(calls[1], /mode=brief/);
+
+  // No mode means the narrow default, never the widest export.
+  const standard = await services.exportMarkdown('session-a');
+  assert.equal(standard.mode, 'standard');
+  assert.match(calls[2], /mode=standard/);
+});
+
+test('a refused clipboard hands the export back instead of losing it', async () => {
+  const { exports } = materialize({
+    clipboard: {
+      writeText: async () => {
+        throw new Error('Document is not focused.');
+      }
+    },
+    execCommand: false,
+    fetch: async () =>
+      new Response('# Title\n\nbody\n', { status: 200, headers: { 'x-conversation-toolkit-title': encodeURIComponent('T') } })
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+
+  const result = await services.exportMarkdown('session-a', { mode: 'standard' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'copy');
+  assert.match(result.detail, /Document is not focused/);
+  // The text and its identity survive, so the caller can reopen the export.
+  assert.equal(result.text, '# Title\n\nbody\n');
+  assert.equal(result.title, 'T');
+  assert.equal(result.sessionId, 'session-a');
+  assert.equal(result.mode, 'standard');
+});
+
+test('a write that the clipboard does not reflect is treated as a failure', async () => {
+  const { exports } = materialize({
+    clipboard: {
+      writeText: async () => {},
+      readText: async () => 'something else entirely'
+    },
+    execCommand: false,
+    fetch: async () => new Response('body', { status: 200 })
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+  const result = await services.exportMarkdown('session-a', { mode: 'brief' });
+  assert.equal(result.ok, false);
+  assert.match(result.detail, /did not change/);
+});
+
+test('an unverifiable clipboard is not treated as a failure', async () => {
+  const { exports } = materialize({
+    clipboard: {
+      writeText: async () => {},
+      readText: async () => {
+        throw new Error('read permission denied');
+      }
+    },
+    fetch: async () => new Response('body', { status: 200 })
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+  const result = await services.exportMarkdown('session-a', { mode: 'brief' });
+  assert.equal(result.ok, true);
+});
+
+test('copyText and saveText serve the fallback dialog', async () => {
+  const written = [];
+  const { exports, downloads } = materialize({
+    clipboard: { writeText: async (value) => written.push(value) },
+    fetch: async () => new Response('body', { status: 200 })
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+
+  const copied = await services.copyText('hello');
+  assert.equal(copied.ok, true);
+  assert.deepEqual(written, ['hello']);
+
+  assert.equal(services.saveText('note.md', 'hello'), true);
+  assert.equal(downloads.length, 1);
+  assert.equal(downloads[0].download, 'note.md');
 });
 
 test('downloading saves a .md file named after the conversation', async () => {
@@ -344,7 +437,7 @@ test('downloading saves a .md file named after the conversation', async () => {
   exports.apply(ctx);
   const services = state.registrations[0].definition.inject('session-a');
 
-  const result = await services.downloadMarkdown('session-abcdef12-3456', { full: true });
+  const result = await services.downloadMarkdown('session-abcdef12-3456', { mode: 'standard' });
   assert.equal(result.ok, true);
   assert.equal(result.chars, '# Title\n\nbody\n'.length);
   assert.equal(downloads.length, 1);
@@ -360,7 +453,7 @@ test('a download falls back to the Session id when the title is unusable', async
   const { ctx, state } = fakeContext();
   exports.apply(ctx);
   const services = state.registrations[0].definition.inject('s');
-  const result = await services.downloadMarkdown('session-abcdef12-3456', { full: true });
+  const result = await services.downloadMarkdown('session-abcdef12-3456', { mode: 'standard' });
   assert.equal(result.ok, true);
   assert.equal(downloads[0].download, 'conversation abcdef12.md');
 });
@@ -417,4 +510,52 @@ test('forkAndOpen refuses a missing cut point instead of forking everything', as
   const services = state.registrations[0].definition.inject('session-a');
   await assert.rejects(() => services.forkAndOpen('session-a', null, null), /cut point/);
   assert.equal(state.forkCalls.length, 0);
+});
+
+test('a failed automatic send retries exactly once, then stops', () => {
+  const { exports } = materialize();
+  const { resendAfterFailure } = exports.internals;
+  // One transient rejection is retried; a second failure must not loop.
+  assert.equal(resendAfterFailure(1), 'retry');
+  assert.equal(resendAfterFailure(2), 'give-up');
+  assert.equal(resendAfterFailure(99), 'give-up');
+});
+
+test('a prefetched export is reused instead of refetched', async () => {
+  const calls = [];
+  const { exports } = materialize({
+    fetch: async (url) => {
+      calls.push(String(url));
+      return new Response('# T\n\nbody\n', { status: 200, headers: { 'x-conversation-toolkit-title': 'T' } });
+    }
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+
+  // Hovering the row fetches ahead, so the click does not have to.
+  assert.equal(await services.prefetch('session-a', { mode: 'standard' }), true);
+  assert.equal(calls.length, 1);
+
+  const copied = await services.exportMarkdown('session-a', { mode: 'standard' });
+  assert.equal(copied.ok, true);
+  assert.equal(calls.length, 1, 'the click reused the prefetched export');
+
+  // A different mode is a different document and must still be fetched.
+  await services.exportMarkdown('session-a', { mode: 'brief' });
+  assert.equal(calls.length, 2);
+});
+
+test('a failed prefetch is harmless', async () => {
+  const { exports } = materialize({
+    fetch: async () => new Response('{"ok":false,"error":{"message":"boom"}}', { status: 500 })
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+  assert.equal(await services.prefetch('session-a', { mode: 'standard' }), false);
+  // The real action still reports its own error.
+  const result = await services.exportMarkdown('session-a', { mode: 'standard' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'export');
 });

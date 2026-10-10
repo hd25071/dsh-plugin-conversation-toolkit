@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-conversation-toolkit",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "description": "Conversation toolkit for DeepSeek Harness: copy a whole conversation as Markdown, copy a deep link that reopens it, edit a user message and resend it, and branch a turn or its reasoning away.",
   "type": "module",
   "license": "MIT",

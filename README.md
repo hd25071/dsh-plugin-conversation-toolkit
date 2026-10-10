@@ -10,8 +10,9 @@ reopens it, edit a user message and resend it, and branch a turn away.
 
 | Feature | Where it appears |
 |---|---|
-| **Copy the whole conversation as Markdown** | Sidebar session `…` menu and a hover button on every session row |
-| **Copy only the dialogue** (no thinking, no tool traffic) | Sidebar session `…` menu |
+| **Copy as Markdown — standard** (dialogue + tool names) | Sidebar session `…` menu and a hover button on every session row |
+| **Copy the full record** (thinking, arguments, results) | Sidebar session `…` menu — asks first, because it can leak |
+| **Copy the dialogue only** | Sidebar session `…` menu |
 | **Download the conversation as a `.md` file** | Sidebar session `…` menu |
 | **Copy a conversation deep link** | Sidebar session `…` menu and the row hover strip |
 | **Edit a user message and resend** | Turn action row under each completed turn |
@@ -21,8 +22,8 @@ reopens it, edit a user message and resend it, and branch a turn away.
 
 Every label is localized (Simplified Chinese and English) and follows the app's active locale.
 
-A long conversation exports to well over a megabyte, so the **download** row exists as the action that always works:
-it never touches the clipboard, the secure-context rules, or a paste target's size limits.
+A long conversation exports to well over a megabyte in full mode, so the **download** row exists as the action that
+always works: it never touches the clipboard, the secure-context rules, or a paste target's size limits.
 
 ## Install
 
@@ -82,6 +83,38 @@ it succeeds the index is durable and every later search is incremental and fast.
 
 After that the sidebar finds message content: it merges name matches with ranked full-text hits and shows a snippet
 per result. `Ctrl/Cmd+K` focuses it.
+
+## Export modes: what leaves the machine
+
+A transcript can carry material that must not leave the machine by accident — thinking often quotes private context,
+tool arguments carry absolute paths and sometimes tokens, and tool results are frequently file dumps or command
+output. **The default is therefore the narrow one.**
+
+| Mode | Dialogue | Thinking | Tool names | Tool arguments and results | System text | Header warning |
+|---|---|---|---|---|---|---|
+| `brief` | yes | — | — | — | — | — |
+| `standard` **(default)** | yes | — | yes | — | — | — |
+| `full` | yes | yes | yes | yes | yes | yes |
+
+`standard` is the conversation plus the names of the tools that ran — readable without the payloads. `full` is the
+only mode that can carry a secret, and it says so in the document itself:
+
+```markdown
+> [!WARNING]
+> This export contains **thinking, tool-call arguments and tool results**.
+> Those routinely carry API tokens, credentials, absolute local paths, file
+> contents and command output. Read it before sharing it.
+```
+
+An unrecognised mode falls back to `standard`, never to `full`. The document header records which mode produced it,
+so a file found later can be judged without opening it.
+
+### Escaping
+
+The document is Markdown, but `<details>`, `<summary>` and `<code>` are raw HTML, so any dynamic text placed inside
+them is escaped — a tool name is model- and tool-influenced, and an unescaped `<` would inject markup into a file the
+user is about to share. Text inside a Markdown **code span** is handled differently: a code span is literal, so
+entities would print as `&lt;`, and what has to be neutralised there is the backtick that would close the span.
 
 ## What the Markdown export contains
 
@@ -232,7 +265,7 @@ server change.
 ## Verification
 
 ```sh
-npm test        # 38 tests: transcript folding, turn indexing, host routes, client bundle contract
+npm test        # 53 tests: transcript folding, export modes, escaping, branching, host routes, client bundle
 ```
 
 - `test/transcript.test.mjs` — Markdown and Turn folding against a synthetic two-turn log **and** against the largest
@@ -261,9 +294,12 @@ npm test        # 38 tests: transcript folding, turn indexing, host routes, clie
   They render nothing until then rather than guessing a cut point.
 - **A deep link only works in a browser that is already authenticated** to that Harness instance — it is a link into
   your local app, not a share link.
-- **The clipboard path needs a secure context** for the async Clipboard API. Opening the app over a plain-HTTP LAN
-  address (not `127.0.0.1`/`localhost`) falls back to `execCommand('copy')`; if that is refused too, the toast names
-  the reason. Use the download row instead.
+- **The clipboard needs a focused window.** `navigator.clipboard.writeText` rejects with `Document is not
+  focused` when the app is in the background, and the `execCommand` fallback needs focus too. The plugin mitigates
+  this in three ways: it prefetches on row hover and when the menu opens, so the write happens immediately after the
+  click; it verifies the write by reading the clipboard back; and if the write is still refused, it reopens the export
+  in a dialog with a retry button and a download button rather than losing it. A copy failure therefore never costs
+  you the export.
 
 ## License
 

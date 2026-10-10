@@ -196,7 +196,31 @@ window.__ModuleLoader__.load({
     }
 
     /** Overlay state: at most one dialog plus one toast, shared by every registration. */
-    const overlayStore = createStore({ dialog: null, toast: null });
+    const overlayStore = createStore({ dialog: null, toast: null, copyFailure: null });
+
+    /**
+     * Reopen a failed copy as a dialog the user can retry from.
+     *
+     * The failure mode this exists for: `navigator.clipboard.writeText` rejects
+     * with "Document is not focused" when the window is in the background, which
+     * is easy to hit because the export is fetched first and copied afterwards.
+     * Reopening the text means the retry happens on a fresh click in a focused
+     * window, and the download button is a path that needs no clipboard at all.
+     *
+     * @param result - the failed `exportMarkdown` outcome, carrying the text.
+     */
+    function openCopyFailure(result) {
+      overlayStore.set({
+        ...overlayStore.get(),
+        copyFailure: {
+          title: result.title ?? result.sessionId ?? 'conversation',
+          sessionId: result.sessionId ?? '',
+          text: result.text,
+          reason: result.detail ?? '',
+          mode: result.mode ?? 'standard'
+        }
+      });
+    }
 
     /**
      * Raise a transient toast.
@@ -208,31 +232,85 @@ window.__ModuleLoader__.load({
       overlayStore.set({ ...overlayStore.get(), toast: { text, tone, seq: Date.now() + Math.random() } });
     }
 
-    /** Pending "resend into the fresh branch" payloads, keyed by child Session id. */
+    /**
+     * Pending "resend into the fresh branch" payloads, keyed by child Session id.
+     *
+     * Each entry is a small state machine rather than a bare string, because the
+     * submit is asynchronous and can fail after the draft was already accepted:
+     *
+     * | state        | meaning                                                  |
+     * |--------------|----------------------------------------------------------|
+     * | `pending`    | waiting for the composer to publish the draft             |
+     * | `submitting` | the draft is in place and `submit()` has been called      |
+     * | `failed`     | the submit failed for good; the text is kept for a retry  |
+     *
+     * Success is removal. The entry used to be deleted *before* the submit, so a
+     * rejected submit lost the text with no way to recover it from the plugin.
+     */
     const pendingResend = new Map();
+
+    /** Delay before the single automatic retry of a failed send. */
+    const RESEND_RETRY_DELAY_MS = 1500;
+
+    /** How many submits one payload may make before the plugin stops trying. */
+    const RESEND_MAX_ATTEMPTS = 2;
+
+    /**
+     * Decide what a failed automatic send should do next.
+     *
+     * Extracted so the bound is testable without a React renderer: a transient
+     * rejection gets exactly one retry, and a second failure stops rather than
+     * looping.
+     *
+     * @param attempts - how many submits have already been made.
+     * @returns `'retry'` or `'give-up'`.
+     */
+    function resendAfterFailure(attempts) {
+      return attempts < RESEND_MAX_ATTEMPTS ? 'retry' : 'give-up';
+    }
+
+    /**
+     * Check whether the clipboard really holds `text`.
+     *
+     * @param text - the text that was just written.
+     * @returns `true`/`false`, or `null` when reading is not permitted.
+     */
+    async function clipboardHolds(text) {
+      // Reading is not always permitted; that is "cannot verify", not failure.
+      try {
+        if (typeof navigator.clipboard?.readText !== 'function') return null;
+        return (await navigator.clipboard.readText()) === text;
+      } catch {
+        return null;
+      }
+    }
 
     /**
      * Copy text to the clipboard.
      *
-     * The async Clipboard API needs a secure context and a focused document, and
-     * is unavailable when the app is opened over a plain-HTTP LAN address, so a
-     * hidden-textarea `execCommand` fallback follows it. That fallback needs the
-     * gesture's activation window, which is why the caller fetches first and
-     * copies last, and why the selection is made explicitly rather than relying
-     * on `select()` alone.
+     * The async Clipboard API needs a secure context AND a focused document, and
+     * it rejects with "Document is not focused" otherwise — which is the normal
+     * state for a background window, and is why a resolved promise alone is not
+     * proof that anything was copied. The write is therefore verified when the
+     * browser allows a read.
      *
      * @param text - the text to copy.
      * @returns `{ ok }` or `{ ok: false, reason }` naming what failed.
      */
     async function writeClipboard(text) {
-      let reason = 'clipboard API unavailable';
+      /** Every attempt's complaint, so the user sees why the whole path failed. */
+      const failures = [];
       try {
         if (typeof navigator.clipboard?.writeText === 'function') {
           await navigator.clipboard.writeText(text);
-          return { ok: true };
+          const matches = await clipboardHolds(text);
+          if (matches !== false) return { ok: true };
+          failures.push('the browser reported success but the clipboard did not change');
+        } else {
+          failures.push('the async Clipboard API is unavailable');
         }
       } catch (error) {
-        reason = describeError(error);
+        failures.push(describeError(error));
       }
       try {
         const area = document.createElement('textarea');
@@ -254,11 +332,12 @@ window.__ModuleLoader__.load({
         const ok = document.execCommand('copy');
         document.body.removeChild(area);
         if (ok) return { ok: true };
-        return { ok: false, reason: 'the browser refused the copy command' };
+        failures.push('the fallback copy command was refused');
       } catch (error) {
         console.error('[conversation-toolkit] clipboard write failed:', error);
-        return { ok: false, reason: describeError(error) };
+        failures.push(describeError(error));
       }
+      return { ok: false, reason: failures.join('; ') };
     }
 
     /**
@@ -284,10 +363,9 @@ window.__ModuleLoader__.load({
      */
     async function fetchTranscript(sessionId, options = {}) {
       const params = new URLSearchParams({ sessionId });
-      // Stated explicitly rather than relying on the route default, so the two
-      // actions keep their meaning if the Host default ever changes.
-      params.set('reasoning', options.reasoning === false ? '0' : '1');
-      params.set('tools', options.tools === false ? '0' : '1');
+      // `mode` is the supported switch. It is stated explicitly rather than left
+      // to the Host default so each action keeps its meaning if that ever changes.
+      params.set('mode', options.mode ?? 'standard');
       const response = await fetch(`${TRANSCRIPT_ROUTE}?${params.toString()}`, { credentials: 'same-origin' });
       if (!response.ok) {
         let detail = `HTTP ${String(response.status)}`;
@@ -309,6 +387,62 @@ window.__ModuleLoader__.load({
         }
       }
       return { text: await response.text(), title };
+    }
+
+    /**
+     * Short-lived export cache, keyed by Session and mode.
+     *
+     * This exists so the clipboard write happens inside the click's own gesture.
+     * `writeText` rejects with "Document is not focused" unless the window has
+     * focus, and a multi-second export between the click and the write is long
+     * enough for the user to look away — which is exactly how the copy "failed"
+     * while the same code worked when driven programmatically.
+     *
+     * @type {Map<string, { text: string, title: string, at: number }>}
+     */
+    const transcriptCache = new Map();
+
+    /** How long a prefetched export stays usable. */
+    const TRANSCRIPT_CACHE_TTL_MS = 30000;
+
+    /**
+     * Compose the cache key for one export.
+     *
+     * @param sessionId - the Session.
+     * @param mode - the export mode.
+     * @returns the key.
+     */
+    function cacheKey(sessionId, mode) {
+      return `${sessionId}\u0000${mode}`;
+    }
+
+    /**
+     * Read a prefetched export, dropping it once it is stale.
+     *
+     * @param sessionId - the Session.
+     * @param mode - the export mode.
+     * @returns the cached export, or `undefined`.
+     */
+    function readCachedTranscript(sessionId, mode) {
+      const key = cacheKey(sessionId, mode);
+      const hit = transcriptCache.get(key);
+      if (hit === undefined) return undefined;
+      if (Date.now() - hit.at > TRANSCRIPT_CACHE_TTL_MS) {
+        transcriptCache.delete(key);
+        return undefined;
+      }
+      return hit;
+    }
+
+    /**
+     * Store a prefetched export.
+     *
+     * @param sessionId - the Session.
+     * @param mode - the export mode.
+     * @param value - the fetched transcript.
+     */
+    function writeCachedTranscript(sessionId, mode, value) {
+      transcriptCache.set(cacheKey(sessionId, mode), { ...value, at: Date.now() });
     }
 
     /**
@@ -517,7 +651,7 @@ window.__ModuleLoader__.load({
      * (user text and answers only).
      *
      * @param options - the variant.
-     * @param options.full - copy the whole record rather than the compact form.
+     * @param options.mode - the export mode this row copies.
      * @param options.labelKey - locale key for the row label.
      * @returns the menu row component.
      */
@@ -525,22 +659,26 @@ window.__ModuleLoader__.load({
       return function CopyMarkdownMenuItem({ sessionId, services, useMenuOpenState, t }) {
         const closeMenu = useMenuCloser(useMenuOpenState);
         const [busy, setBusy] = React.useState(false);
+        // The menu only mounts its rows when it opens, so this is the earliest
+        // safe moment to start the export the click will need.
+        React.useEffect(() => {
+          void services.prefetch(sessionId, { mode: options.mode });
+        }, [services, sessionId]);
         const onSelect = React.useCallback(() => {
           closeMenu();
           setBusy(true);
           services
-            .exportMarkdown(sessionId, { full: options.full })
+            .exportMarkdown(sessionId, { mode: options.mode })
             .then((result) => {
               if (result.ok) {
                 notify(t('toast.markdownCopied', { n: String(result.chars) }));
                 return;
               }
-              notify(
-                result.code === 'copy'
-                  ? t('toast.copyFailedDetail', { detail: result.detail ?? '' })
-                  : t('toast.exportFailed', { detail: result.detail ?? '' }),
-                'error'
-              );
+              if (result.code === 'copy' && typeof result.text === 'string') {
+                openCopyFailure(result);
+                return;
+              }
+              notify(t('toast.exportFailed', { detail: result.detail ?? '' }), 'error');
             })
             .finally(() => setBusy(false));
         }, [closeMenu, services, sessionId, t]);
@@ -553,11 +691,14 @@ window.__ModuleLoader__.load({
       };
     }
 
-    /** Menu row (order 500): copy the whole conversation, reasoning and tools included. */
-    const CopyMarkdownMenuItem = copyMarkdownMenuItem({ full: true, labelKey: 'menu.copyMarkdown' });
+    /** Menu row (order 500): the default export — the conversation plus tool names. */
+    const CopyMarkdownMenuItem = copyMarkdownMenuItem({ mode: 'standard', labelKey: 'menu.copyMarkdown' });
 
-    /** Menu row (order 505): copy only the user text and the answers. */
-    const CopyMarkdownBriefMenuItem = copyMarkdownMenuItem({ full: false, labelKey: 'menu.copyMarkdownBrief' });
+    /** Menu row (order 505): everything in the log, with a sensitivity warning. */
+    const CopyMarkdownFullMenuItem = copyMarkdownMenuItem({ mode: 'full', labelKey: 'menu.copyMarkdownFull' });
+
+    /** Menu row (order 510): only the user text and the answers. */
+    const CopyMarkdownBriefMenuItem = copyMarkdownMenuItem({ mode: 'brief', labelKey: 'menu.copyMarkdownBrief' });
 
     /**
      * Sidebar menu row: save the conversation as a `.md` file.
@@ -576,7 +717,7 @@ window.__ModuleLoader__.load({
         closeMenu();
         setBusy(true);
         services
-          .downloadMarkdown(sessionId, { full: true })
+          .downloadMarkdown(sessionId, { mode: 'standard' })
           .then((result) => {
             if (result.ok) {
               notify(t('toast.markdownSaved', { name: result.filename }));
@@ -633,16 +774,24 @@ window.__ModuleLoader__.load({
      */
     function CopyMarkdownRowButton({ sessionId, services, t }) {
       const [busy, setBusy] = React.useState(false);
+      // Hovering the row is the user telling us they are about to copy.
+      const onHover = React.useCallback(() => {
+        void services.prefetch(sessionId, { mode: 'standard' });
+      }, [services, sessionId]);
       const onSelect = React.useCallback(() => {
         setBusy(true);
         services
-          .exportMarkdown(sessionId, { full: true })
+          .exportMarkdown(sessionId, { mode: 'standard' })
           .then((result) => {
             if (result.ok) {
               notify(t('toast.markdownCopied', { n: String(result.chars) }));
               return;
             }
-            notify(result.code === 'copy' ? t('toast.copyFailed') : t('toast.exportFailed', { detail: result.detail ?? '' }), 'error');
+            if (result.code === 'copy' && typeof result.text === 'string') {
+              openCopyFailure(result);
+              return;
+            }
+            notify(t('toast.exportFailed', { detail: result.detail ?? '' }), 'error');
           })
           .finally(() => setBusy(false));
       }, [services, sessionId, t]);
@@ -651,9 +800,13 @@ window.__ModuleLoader__.load({
         {
           type: 'button',
           className: 'ctk-icon-button',
+          // Stable hook so an automated probe can drive the real click path.
+          'data-ctk-action': 'copy-markdown',
           title: t('menu.copyMarkdown'),
           'aria-label': t('menu.copyMarkdown'),
           disabled: busy,
+          onMouseEnter: onHover,
+          onFocus: onHover,
           onClick: onSelect
         },
         h(IconCopy, null)
@@ -683,6 +836,7 @@ window.__ModuleLoader__.load({
         {
           type: 'button',
           className: 'ctk-icon-button',
+          'data-ctk-action': 'copy-link',
           title: t('menu.copyLink'),
           'aria-label': t('menu.copyLink'),
           onClick: onSelect
@@ -859,6 +1013,41 @@ window.__ModuleLoader__.load({
         overlayStore.set({ ...overlayStore.get(), dialog: null });
       }, []);
 
+      const closeCopyFailure = React.useCallback(() => {
+        overlayStore.set({ ...overlayStore.get(), copyFailure: null });
+      }, []);
+
+      const copyFailure = state.copyFailure;
+
+      /** Retry the clipboard inside this click's own focused gesture. */
+      const retryCopy = React.useCallback(() => {
+        const pending = overlayStore.get().copyFailure;
+        if (pending === null || pending === undefined) return;
+        setBusy(true);
+        services.copyText(pending.text).then((result) => {
+          setBusy(false);
+          if (result.ok) {
+            closeCopyFailure();
+            notify(t('toast.markdownCopied', { n: String(pending.text.length) }));
+            return;
+          }
+          setFailure(result.reason ?? '');
+        });
+      }, [closeCopyFailure, services, t]);
+
+      /** Take the clipboard out of the picture entirely. */
+      const retryDownload = React.useCallback(() => {
+        const pending = overlayStore.get().copyFailure;
+        if (pending === null || pending === undefined) return;
+        const filename = markdownFilename(pending.title, pending.sessionId);
+        if (services.saveText(filename, pending.text)) {
+          closeCopyFailure();
+          notify(t('toast.markdownSaved', { name: filename }));
+          return;
+        }
+        setFailure(t('toast.downloadFailed'));
+      }, [closeCopyFailure, services, t]);
+
       const toast = state.toast;
       React.useEffect(() => {
         if (toast === null || toast === undefined) return undefined;
@@ -988,6 +1177,48 @@ window.__ModuleLoader__.load({
         );
       }
 
+      if (copyFailure !== null && copyFailure !== undefined) {
+        dialogs.push(
+          h(
+            'div',
+            {
+              key: 'copy-failure',
+              className: 'ctk-overlay',
+              role: 'presentation',
+              onMouseDown: (event) => {
+                if (event.target === event.currentTarget && !busy) closeCopyFailure();
+              }
+            },
+            h(
+              'div',
+              { className: 'ctk-dialog', role: 'dialog', 'aria-modal': true, 'aria-label': t('copyFail.title') },
+              h('div', { className: 'ctk-dialog-title' }, t('copyFail.title')),
+              h('div', { className: 'ctk-dialog-desc' }, t('copyFail.desc', { detail: copyFailure.reason })),
+              h('textarea', {
+                className: 'ctk-textarea',
+                value: copyFailure.text,
+                readOnly: true,
+                autoFocus: true,
+                spellCheck: false,
+                onFocus: (event) => event.target.select()
+              }),
+              failure !== null ? h('div', { className: 'ctk-dialog-desc', role: 'alert' }, failure) : null,
+              h(
+                'div',
+                { className: 'ctk-dialog-footer' },
+                h('button', { type: 'button', className: 'ctk-button', disabled: busy, onClick: closeCopyFailure }, t('cancel')),
+                h('button', { type: 'button', className: 'ctk-button', disabled: busy, onClick: retryDownload }, t('copyFail.download')),
+                h(
+                  'button',
+                  { type: 'button', className: 'ctk-button', 'data-variant': 'primary', disabled: busy, onClick: retryCopy },
+                  busy ? t('working') : t('copyFail.copy')
+                )
+              )
+            )
+          )
+        );
+      }
+
       if (toast !== null && toast !== undefined) {
         dialogs.push(h('div', { key: 'toast', className: 'ctk-toast', 'data-tone': toast.tone, role: 'status' }, toast.text));
       }
@@ -1006,22 +1237,62 @@ window.__ModuleLoader__.load({
      * @returns nothing; this is a behaviour-only component.
      */
     function PendingResend({ sessionId, input, inputActions, t }) {
-      const pending = pendingResend.get(sessionId);
+      const entry = pendingResend.get(sessionId);
+      // A failed submit re-arms through this counter: the record is mutated in
+      // place, so React needs an explicit reason to run the effect again.
+      const [tick, setTick] = React.useState(0);
+
+      // Step 1: publish the text into the composer.
       React.useEffect(() => {
-        if (pending === undefined || inputActions?.setDraft === undefined) return;
-        inputActions.setDraft(pending);
-      }, [pending, inputActions]);
+        if (entry === undefined || entry.state !== 'pending') return;
+        if (inputActions?.setDraft === undefined) return;
+        inputActions.setDraft(entry.text);
+      }, [entry, inputActions]);
+
+      // Step 2: submit, but only once the composer really carries the text.
       React.useEffect(() => {
-        if (pending === undefined) return;
-        if (input?.draft !== pending) return;
-        if (typeof inputActions?.submit !== 'function') return;
-        pendingResend.delete(sessionId);
+        if (entry === undefined || entry.state !== 'pending') return undefined;
+        if (input?.draft !== entry.text) return undefined;
+        if (typeof inputActions?.submit !== 'function') return undefined;
+
+        entry.state = 'submitting';
+        entry.attempts += 1;
+        let timer = null;
+
+        /**
+         * Record a failed send.
+         *
+         * @param error - the thrown or rejected value.
+         */
+        const fail = (error) => {
+          const detail = describeError(error);
+          entry.error = detail;
+          if (resendAfterFailure(entry.attempts) === 'retry') {
+            entry.state = 'pending';
+            notify(t('toast.resendRetrying', { detail }), 'error');
+            timer = setTimeout(() => setTick((value) => value + 1), RESEND_RETRY_DELAY_MS);
+            return;
+          }
+          entry.state = 'failed';
+          notify(t('toast.resendFailed', { detail }), 'error');
+        };
+
         try {
-          inputActions.submit();
+          const outcome = inputActions.submit();
+          if (outcome !== null && outcome !== undefined && typeof outcome.then === 'function') {
+            // The rejection is the case the old code missed entirely.
+            outcome.then(() => pendingResend.delete(sessionId)).catch(fail);
+          } else {
+            pendingResend.delete(sessionId);
+          }
         } catch (error) {
-          notify(t('toast.resendFailed', { detail: describeError(error) }), 'error');
+          fail(error);
         }
-      }, [pending, input, inputActions, sessionId, t]);
+        return () => {
+          if (timer !== null) clearTimeout(timer);
+        };
+      }, [entry, input, inputActions, sessionId, t, tick]);
+
       return null;
     }
 
@@ -1057,6 +1328,7 @@ window.__ModuleLoader__.load({
      * @param ctx - the client root context.
      */
     function apply(ctx) {
+
       ctx.effect(() => {
         const tag = document.createElement('style');
         tag.dataset.plugin = 'dsh-plugin-conversation-toolkit';
@@ -1070,9 +1342,14 @@ window.__ModuleLoader__.load({
         () =>
           ctx.locale.register(NS, {
             zh: {
-              'menu.copyMarkdown': '复制全文为 Markdown',
-              'menu.copyMarkdownBrief': '复制为 Markdown（不含思考与工具）',
-              'menu.downloadMarkdown': '下载为 .md 文件',
+              'menu.copyMarkdown': '复制为 Markdown（标准版）',
+              'menu.copyMarkdownFull': '复制完整版（含思考与工具，可能含敏感信息）',
+              'menu.copyMarkdownBrief': '复制简洁版（仅对话）',
+              'menu.downloadMarkdown': '下载为 .md 文件（标准版）',
+              'copyFail.title': '复制被浏览器拒绝',
+              'copyFail.desc': '原因：{detail}。内容已备好，可在下面重新复制或直接下载。',
+              'copyFail.copy': '重新复制',
+              'copyFail.download': '下载为 .md',
               'menu.copyMarkdown.busy': '正在导出…',
               'menu.copyLink': '复制对话链接',
               'turn.label': '第 {n} 轮',
@@ -1102,15 +1379,21 @@ window.__ModuleLoader__.load({
               'toast.branchResent': '已在新分支中重新发送',
               'toast.sessionRunning': '该会话正在运行，请先停止再操作',
               'toast.turnUnknown': '这一轮的日志尚未就绪，请稍后重试',
+              'toast.resendRetrying': '自动发送失败（{detail}），正在重试一次…',
               'toast.resendFailed': '自动发送失败（{detail}），内容已放入输入框，请按 Enter 发送',
               'close': '关闭',
               'cancel': '取消',
               'working': '处理中…'
             },
             en: {
-              'menu.copyMarkdown': 'Copy the full conversation as Markdown',
-              'menu.copyMarkdownBrief': 'Copy as Markdown (without thinking and tools)',
-              'menu.downloadMarkdown': 'Download as a .md file',
+              'menu.copyMarkdown': 'Copy as Markdown (standard)',
+              'menu.copyMarkdownFull': 'Copy the full record (thinking + tools; may contain secrets)',
+              'menu.copyMarkdownBrief': 'Copy the dialogue only',
+              'menu.downloadMarkdown': 'Download as a .md file (standard)',
+              'copyFail.title': 'The browser refused the copy',
+              'copyFail.desc': 'Reason: {detail}. The export is ready below — copy it again, or download it.',
+              'copyFail.copy': 'Copy again',
+              'copyFail.download': 'Download .md',
               'menu.copyMarkdown.busy': 'Exporting…',
               'menu.copyLink': 'Copy conversation link',
               'turn.label': 'Turn {n}',
@@ -1140,6 +1423,7 @@ window.__ModuleLoader__.load({
               'toast.branchResent': 'Resent in a new branch',
               'toast.sessionRunning': 'This Session is running; stop it first',
               'toast.turnUnknown': 'This turn is not readable yet; try again shortly',
+              'toast.resendRetrying': 'Automatic send failed ({detail}); retrying once…',
               'toast.resendFailed': 'Automatic send failed ({detail}); the text is in the composer — press Enter',
               'close': 'Close',
               'cancel': 'Cancel',
@@ -1165,16 +1449,56 @@ window.__ModuleLoader__.load({
          * @returns a structured outcome the caller localizes.
          */
         async exportMarkdown(sessionId, options = {}) {
+          const mode = options.mode ?? 'standard';
           try {
-            const { text } = await fetchTranscript(sessionId, {
-              reasoning: options.full !== false,
-              tools: options.full !== false
-            });
+            const { text, title } = readCachedTranscript(sessionId, mode) ?? (await fetchTranscript(sessionId, { mode }));
             const copied = await writeClipboard(text);
-            return copied.ok ? { ok: true, chars: text.length } : { ok: false, code: 'copy', detail: copied.reason };
+            if (copied.ok) return { ok: true, chars: text.length, mode };
+            // Hand the text back: the caller reopens it in a dialog whose buttons
+            // run inside a fresh, focused gesture, instead of losing the export.
+            return { ok: false, code: 'copy', detail: copied.reason, text, title, sessionId, mode };
           } catch (error) {
-            return { ok: false, code: 'export', detail: describeError(error) };
+            return { ok: false, code: 'export', detail: describeError(error), mode };
           }
+        },
+        /**
+         * Fetch one export ahead of the click, so the click can copy immediately.
+         *
+         * Failures are swallowed: a prefetch is an optimisation, and the real
+         * action reports its own errors.
+         *
+         * @param sessionId - the Session to export.
+         * @param options - render switches.
+         * @returns whether a cached export is now available.
+         */
+        async prefetch(sessionId, options = {}) {
+          const mode = options.mode ?? 'standard';
+          if (readCachedTranscript(sessionId, mode) !== undefined) return true;
+          try {
+            writeCachedTranscript(sessionId, mode, await fetchTranscript(sessionId, { mode }));
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        /**
+         * Copy already-fetched text, for the focused retry in the fallback dialog.
+         *
+         * @param text - the text to copy.
+         * @returns the clipboard outcome.
+         */
+        async copyText(text) {
+          return writeClipboard(text);
+        },
+        /**
+         * Save already-fetched text as a file.
+         *
+         * @param filename - the suggested filename.
+         * @param text - the document.
+         * @returns whether the browser accepted the download.
+         */
+        saveText(filename, text) {
+          return saveMarkdown(filename, text);
         },
         /**
          * Export one Session as Markdown and save it as a file.
@@ -1184,11 +1508,9 @@ window.__ModuleLoader__.load({
          * @returns a structured outcome the caller localizes.
          */
         async downloadMarkdown(sessionId, options = {}) {
+          const mode = options.mode ?? 'standard';
           try {
-            const { text, title } = await fetchTranscript(sessionId, {
-              reasoning: options.full !== false,
-              tools: options.full !== false
-            });
+            const { text, title } = await fetchTranscript(sessionId, { mode });
             const filename = markdownFilename(title, sessionId);
             return saveMarkdown(filename, text) ? { ok: true, chars: text.length, filename } : { ok: false, code: 'download' };
           } catch (error) {
@@ -1206,7 +1528,9 @@ window.__ModuleLoader__.load({
         async forkAndOpen(sessionId, cutSeq, resendText) {
           if (typeof cutSeq !== 'number' || cutSeq < 0) throw new Error('the cut point is not available for this turn');
           const childId = await ctx.sessions.fork({ sessionId, atSeq: cutSeq, increaseTitle: true });
-          if (typeof resendText === 'string' && resendText.trim() !== '') pendingResend.set(childId, resendText);
+          if (typeof resendText === 'string' && resendText.trim() !== '') {
+            pendingResend.set(childId, { text: resendText, state: 'pending', attempts: 0, error: null });
+          }
           turnCache.drop(childId);
           ctx.uiWorkspace.openSession(childId);
           return childId;
@@ -1227,8 +1551,18 @@ window.__ModuleLoader__.load({
         yield ctx.slots.register(
           {
             name: 'sidebar.workspaces.session.menu.item',
-            id: 'conversation-toolkit.copy-markdown-brief',
+            id: 'conversation-toolkit.copy-markdown-full',
             order: 505,
+            locale: NS,
+            inject: () => services
+          },
+          CopyMarkdownFullMenuItem
+        );
+        yield ctx.slots.register(
+          {
+            name: 'sidebar.workspaces.session.menu.item',
+            id: 'conversation-toolkit.copy-markdown-brief',
+            order: 510,
             locale: NS,
             inject: () => services
           },
@@ -1238,7 +1572,7 @@ window.__ModuleLoader__.load({
           {
             name: 'sidebar.workspaces.session.menu.item',
             id: 'conversation-toolkit.download-markdown',
-            order: 508,
+            order: 515,
             locale: NS,
             inject: () => services
           },
@@ -1248,7 +1582,7 @@ window.__ModuleLoader__.load({
           {
             name: 'sidebar.workspaces.session.menu.item',
             id: 'conversation-toolkit.copy-link',
-            order: 510,
+            order: 520,
             locale: NS,
             inject: () => services
           },
@@ -1347,6 +1681,12 @@ window.__ModuleLoader__.load({
     /** Last deep link written per Session, exposed for diagnostics in the console. */
     const lastLink = new Map();
 
-    return { name: 'conversation-toolkit', inject, apply, internals: { deepLink, lastLink } };
+    return {
+      name: 'conversation-toolkit',
+      inject,
+      apply,
+      // `internals` is the test seam: pure helpers the bundle tests exercise directly.
+      internals: { deepLink, lastLink, resendAfterFailure }
+    };
   }
 });
