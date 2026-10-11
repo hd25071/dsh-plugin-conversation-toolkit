@@ -509,6 +509,30 @@ window.__ModuleLoader__.load({
 
 
     /**
+     * Render one Turn as Markdown.
+     *
+     * The single-turn copy has no mode selector, so its boundary is stated in the
+     * text instead: it carries the user's own words verbatim and that turn's
+     * reasoning, and it says so. Kept pure so the promise is testable directly.
+     *
+     * @param turn - the Turn record.
+     * @returns the Markdown.
+     */
+    function turnMarkdown(turn) {
+      const parts = [];
+      parts.push(`## Turn ${String(turn.turn)}`);
+      parts.push('- **Careful**: your own messages are included verbatim and may contain secrets.');
+      if (turn.user !== null && turn.user !== undefined && turn.user.text.trim() !== '') {
+        parts.push('### User', '', turn.user.text);
+      }
+      if (turn.assistant.reasoning.trim() !== '') {
+        parts.push('', '<details><summary>Thinking</summary>', '', turn.assistant.reasoning, '', '</details>');
+      }
+      if (turn.assistant.text.trim() !== '') parts.push('', '### Assistant', '', turn.assistant.text);
+      return parts.join('\n');
+    }
+
+    /**
      * Build the deep link for one Session.
      *
      * The Web shell never rewrites the document URL, so the query parameter this
@@ -892,14 +916,7 @@ window.__ModuleLoader__.load({
 
       const onCopy = React.useCallback(() => {
         if (!guard()) return;
-        const parts = [];
-        parts.push(`## Turn ${String(turn.turn)}`);
-        if (turn.user !== null && turn.user.text.trim() !== '') parts.push('### User', '', turn.user.text);
-        if (turn.assistant.reasoning.trim() !== '') {
-          parts.push('', '<details><summary>Thinking</summary>', '', turn.assistant.reasoning, '', '</details>');
-        }
-        if (turn.assistant.text.trim() !== '') parts.push('', '### Assistant', '', turn.assistant.text);
-        writeClipboard(parts.join('\n')).then((result) =>
+        writeClipboard(turnMarkdown(turn)).then((result) =>
           notify(result.ok ? t('toast.turnCopied') : t('toast.copyFailedDetail', { detail: result.reason }), result.ok ? 'info' : 'error')
         );
       }, [guard, t, turn]);
@@ -1392,7 +1409,7 @@ window.__ModuleLoader__.load({
       inject,
       apply,
       // `internals` is the test seam: pure helpers the bundle tests exercise directly.
-      internals: { deepLink, lastLink, withServices }
+      internals: { deepLink, lastLink, turnMarkdown, withServices }
     };
   }
 });

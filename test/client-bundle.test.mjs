@@ -342,6 +342,22 @@ test('apply() declares both locale dictionaries with identical key sets', () => 
   assert.deepEqual(Object.keys(locale.dicts.zh).sort(), Object.keys(locale.dicts.en).sort());
 });
 
+test('the single-turn copy states its privacy boundary', () => {
+  // The turn action has no mode selector, so its boundary lives in the text: it
+  // carries the user's own words verbatim AND that turn's reasoning, and says so.
+  const { exports } = materialize();
+  const markdown = exports.internals.turnMarkdown({
+    turn: 4,
+    user: { text: 'my secret question' },
+    assistant: { text: 'the answer', reasoning: 'the thinking' }
+  });
+  assert.match(markdown, /## Turn 4/);
+  assert.match(markdown, /\*\*Careful\*\*: your own messages are included verbatim/, 'the boundary is stated');
+  assert.match(markdown, /<details><summary>Thinking<\/summary>/, 'the reasoning is labelled, not hidden');
+  assert.match(markdown, /my secret question/);
+  assert.match(markdown, /the answer/);
+});
+
 test('registered components render with their documented props', async () => {
   const { exports, React } = materialize();
   const { ctx, state } = fakeContext();
@@ -682,6 +698,15 @@ test('v0.5.1 opening the menu never prefetches the full record', () => {
     assert.doesNotMatch(call, /options\.mode/, 'a menu row must not prefetch its own mode: ' + call);
   }
 });
+
+/** A minimal Turn-index envelope for the single-turn copy. */
+function routeBody() {
+  return (
+    '{"ok":true,"value":{"sessionId":"session-a","title":"T","eventCount":6,"turns":[' +
+    '{"turn":1,"startSeq":1,"endSeq":6,"cutSeq":null,"dropSeq":null,' +
+    '"user":{"seq":3,"text":"hello"},"assistant":{"text":"hi","reasoning":"thought","toolCalls":0}}]}}'
+  );
+}
 
 // ─── v0.5.2 ─────────────────────────────────────────────────────────────
 

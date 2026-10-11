@@ -214,9 +214,7 @@ bundle patch 只插入一行 Host row；浏览器半边会由本包的 `dsh.clie
 | `sidebar.workspaces.session.menu.item` | `copy-markdown`(500)、`copy-markdown-brief`(505)、`download-markdown`(508)、`copy-link`(510) |
 | `sidebar.workspaces.session.row.action` | `copy-markdown`(150)、`copy-link`(160) |
 | `conversation.chat.turnTail` | `turn-actions`(300) |
-| `shell.overlay` | `dialogs`(20) —— 编辑弹窗、确认弹窗、提示条 |
 
-### 为什么"编辑"是分叉而不是改写
 
 DSH 的会话是**只追加**日志：已提交事件永不改写，平台唯一暴露的裁剪原语是
 
@@ -224,19 +222,13 @@ DSH 的会话是**只追加**日志：已提交事件永不改写，平台唯一
 session.fork({ sessionId, atSeq })   // atSeq 是【闭区间】截断点
 ```
 
-整个发行版里没有 edit / delete / truncate / rewind / resend 任何 API —— 对全部客户端 bundle 做全量扫描，
-`rollback`、`rewind`、`resend`、`editMessage`、`deleteMessage`、`removeMessage`、`hideThinking`、`truncateMessages`
 命中数均为 0。
 
-所以本插件的每个操作都是"一次裁剪 + 可选的一次重发"：
 
 | 操作 | 截断点 | 之后 |
 |---|---|---|
-| 编辑并重发 | 该轮 `turn/start` 之前一个事件 | 打开子会话，把改好的文本填进输入框并提交 |
-| 重新生成 | 该轮 `user/message` 的序号 | 打开子会话，用原文重新提问 |
 | 删除本轮及之后 | 该轮 `turn/start` 之前一个事件 | 打开子会话 |
 
-**原会话永远不被修改。** 每个操作都新建一个会话并打开它，与应用自带"分叉"按钮走的是同一套机制。操作失误的代价只是
 侧边栏多出一个会话，绝不会丢历史。
 
 ### 没有路由也能做深链接
@@ -298,8 +290,6 @@ GitHub 托管运行器没有，同一套测试会报 `skipped=2`。两者都对 
   `SESSION_QUERY_PERSISTENCE_FAILED` 失败；空闲时重试即可。
 - **不能删除整个会话。** DSH 没有会话删除 RPC，只有 `workspace/archiveSession`。请用自带的"归档"。手工删
   `session.v4.jsonl.zstd` 还会让 SQLite 搜索索引失配，因此刻意不做。
-  就不可能。"重新生成"是"删除思考过程"的诚实版本，整步丢弃后重新提问。
-- **会话运行中相关操作会被禁用**，因为对进行中的对话分叉会得到一个前缀停在半途的子会话。
 - **回合操作要等索引加载完才出现**（每个会话一次请求，页面生命周期内缓存）。
 - **深链接只对已经认证过的浏览器有效** —— 它是"打开你本机应用"的链接，不是分享链接。
   再自动调一次就可能重复发送。所以失败时把载荷停在 `failed`，在输入框上方显示一条小条，带**重试发送**和

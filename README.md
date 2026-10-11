@@ -265,7 +265,7 @@ tokens, so a renamed token degrades appearance rather than blanking the slot.
 
 ```sh
 npm run check   # syntax-check every source file, then run the suite
-npm test        # 71 tests
+npm test        # 61 tests
 ```
 
 CI runs `npm run check` on **ubuntu-latest** and **windows-latest**, and prints the pass and skip counts
