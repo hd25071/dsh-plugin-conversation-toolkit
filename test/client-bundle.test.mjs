@@ -352,7 +352,12 @@ test('the single-turn copy states its privacy boundary', () => {
     assistant: { text: 'the answer', reasoning: 'the thinking' }
   });
   assert.match(markdown, /## Turn 4/);
-  assert.match(markdown, /\*\*Careful\*\*: your own messages are included verbatim/, 'the boundary is stated');
+  assert.match(markdown, /\*\*Careful\*\*: your own messages are included verbatim/, 'the user-message boundary is stated');
+  assert.match(
+    markdown,
+    /includes assistant thinking, which may contain sensitive information/,
+    'and the thinking is called out, not just collapsed behind a details tag'
+  );
   assert.match(markdown, /<details><summary>Thinking<\/summary>/, 'the reasoning is labelled, not hidden');
   assert.match(markdown, /my secret question/);
   assert.match(markdown, /the answer/);

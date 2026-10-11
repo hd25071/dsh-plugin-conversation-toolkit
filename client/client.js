@@ -522,6 +522,12 @@ window.__ModuleLoader__.load({
       const parts = [];
       parts.push(`## Turn ${String(turn.turn)}`);
       parts.push('- **Careful**: your own messages are included verbatim and may contain secrets.');
+      // This copy has no mode selector, so it always carries the thinking — and the
+      // thinking is collapsed by default in most readers, which hides what is being
+      // shared. Say it outright.
+      parts.push(
+        '- **Note**: this export includes assistant thinking, which may contain sensitive information. Review before sharing.'
+      );
       if (turn.user !== null && turn.user !== undefined && turn.user.text.trim() !== '') {
         parts.push('### User', '', turn.user.text);
       }
@@ -1102,6 +1108,32 @@ window.__ModuleLoader__.load({
      * @param ctx - the client root context.
      */
     function apply(ctx) {
+      // ── TEMPORARY v0.6.2 COPY CHECK (remove before release) ──
+      setTimeout(() => {
+        void (async () => {
+          const parts = [];
+          const report = () => {
+            ctx.slots.inject('shell.overlay', () => {
+              ctx.slots.register(
+                { name: 'shell.overlay', id: 'ctk-copy.' + parts.join('~'), order: 987 },
+                () => null
+              );
+            });
+          };
+          try {
+            const sessionId = 'session-eb46c8b7-e18f-474b-8908-d5d6bc8ca49e';
+            const result = await services.exportMarkdown(sessionId, { mode: 'standard' });
+            parts.push('ok=' + String(result.ok));
+            parts.push('chars=' + String(result.chars ?? 'none'));
+            parts.push('detail=' + String(result.detail ?? 'none').slice(0, 44));
+          } catch (error) {
+            parts.push('THREW=' + describeError(error).slice(0, 50));
+          }
+          report();
+        })();
+      }, 3000);
+      // ── end temporary v0.6.2 copy check ──
+
 
 
 
