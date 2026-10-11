@@ -3,7 +3,7 @@
 [English](README.md) | 中文
 
 一个原生 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件，补上应用本身没有的对话操作：
-把**整段对话全文**导出成 Markdown、存成 .md 文件、复制可重新打开的对话链接、编辑用户消息并重发、以及分叉删掉某一轮。
+把**整段对话全文**导出成 Markdown、存成 .md 文件、复制可重新打开的对话链接、以及搜索所有对话的内容。
 
 ## 范围
 
@@ -26,9 +26,6 @@
 | **复制简洁版**（仅对话） | 侧边栏会话 `…` 菜单 |
 | **下载为 `.md` 文件** | 侧边栏会话 `…` 菜单 |
 | **复制对话深链接** | 侧边栏会话 `…` 菜单与行 hover 区 |
-| **编辑用户消息并重新发送** | 每个已完成回合下方的操作行 |
-| **重新生成某一轮** | 同一行 —— 丢弃该轮回答**及其思考过程**后重新提问 |
-| **删除某一轮及其之后** | 同一行 |
 | **复制本轮对话** | 同一行 —— 用户消息 + 思考 + 回答，输出 Markdown |
 
 所有文案都做了中英双语，跟随应用当前语言。
@@ -217,7 +214,6 @@ bundle patch 只插入一行 Host row；浏览器半边会由本包的 `dsh.clie
 | `sidebar.workspaces.session.menu.item` | `copy-markdown`(500)、`copy-markdown-brief`(505)、`download-markdown`(508)、`copy-link`(510) |
 | `sidebar.workspaces.session.row.action` | `copy-markdown`(150)、`copy-link`(160) |
 | `conversation.chat.turnTail` | `turn-actions`(300) |
-| `conversation.input.dock` | `resend`(−10) —— 不渲染任何东西；它存在只是因为输入框 dock 是唯一同时拿得到会话身份与输入框 `input`/`inputActions` 的位置，"编辑并重发"需要这两样 |
 | `shell.overlay` | `dialogs`(20) —— 编辑弹窗、确认弹窗、提示条 |
 
 ### 为什么"编辑"是分叉而不是改写
@@ -302,7 +298,6 @@ GitHub 托管运行器没有，同一套测试会报 `skipped=2`。两者都对 
   `SESSION_QUERY_PERSISTENCE_FAILED` 失败；空闲时重试即可。
 - **不能删除整个会话。** DSH 没有会话删除 RPC，只有 `workspace/archiveSession`。请用自带的"归档"。手工删
   `session.v4.jsonl.zstd` 还会让 SQLite 搜索索引失配，因此刻意不做。
-- **删除某一轮会连同该轮回答一起删除。** 思考过程无法单独去掉：它属于产生它的那一步助手输出，而改写已存事件在设计上
   就不可能。"重新生成"是"删除思考过程"的诚实版本，整步丢弃后重新提问。
 - **会话运行中相关操作会被禁用**，因为对进行中的对话分叉会得到一个前缀停在半途的子会话。
 - **回合操作要等索引加载完才出现**（每个会话一次请求，页面生命周期内缓存）。

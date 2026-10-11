@@ -4,7 +4,7 @@ English | [中文](README.zh.md)
 
 A native plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) that adds the conversation
 affordances the app does not ship: export a whole conversation as Markdown, save it as a file, copy a link that
-reopens it, edit a user message and resend it, and branch a turn away.
+reopens it, and search the content of every conversation.
 
 ## Scope
 
@@ -30,10 +30,7 @@ fork they cost. The last release that had them is `backup/full-toolkit`.
 | **Copy the dialogue only** | Sidebar session `…` menu |
 | **Download the conversation as a `.md` file** | Sidebar session `…` menu |
 | **Copy a conversation deep link** | Sidebar session `…` menu and the row hover strip |
-| **Edit a user message and resend** | Turn action row under each completed turn |
-| **Regenerate a turn** | Same row — drops that turn's reply *and its reasoning*, then asks again |
-| **Delete a turn and everything after** | Same row |
-| **Copy one turn** | Same row — user text, reasoning and answer as Markdown |
+| **Copy one turn** | Turn action row under each completed turn — user text, reasoning and answer as Markdown |
 
 Every label is localized (Simplified Chinese and English) and follows the app's active locale.
 
@@ -239,7 +236,6 @@ tokens, so a renamed token degrades appearance rather than blanking the slot.
 | `sidebar.workspaces.session.menu.item` | `copy-markdown` (500), `copy-markdown-brief` (505), `download-markdown` (508), `copy-link` (510) |
 | `sidebar.workspaces.session.row.action` | `copy-markdown` (150), `copy-link` (160) |
 | `conversation.chat.turnTail` | `turn-actions` (300) |
-| `conversation.input.dock` | `resend` (−10) — renders nothing; it exists only because the dock is the one seat that receives both the Session identity and the composer's `input`/`inputActions`, which "edit and resend" needs |
 | `shell.overlay` | `dialogs` (20) — the edit dialog, the confirm dialog and the toast |
 
 ## Development notes
