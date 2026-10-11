@@ -264,12 +264,16 @@ window.__ModuleLoader__.load({
       try {
         if (typeof navigator.clipboard?.writeText === 'function') {
           await navigator.clipboard.writeText(text);
-          const matches = await clipboardHolds(text);
-          if (matches !== false) return { ok: true };
-          failures.push('the browser reported success but the clipboard did not change');
-        } else {
-          failures.push('the async Clipboard API is unavailable');
+          // A resolved write IS the success signal, and nothing here may override
+          // it. The read-back is a confirmation only: a read can race the write or
+          // be answered from a stale clipboard, and treating that as failure
+          // reported "copy was refused" for copies that had worked.
+          if ((await clipboardHolds(text)) === false) {
+            console.warn('[conversation-toolkit] clipboard read-back did not match; the write resolved, so it stands');
+          }
+          return { ok: true };
         }
+        failures.push('the async Clipboard API is unavailable');
       } catch (error) {
         failures.push(describeError(error));
       }

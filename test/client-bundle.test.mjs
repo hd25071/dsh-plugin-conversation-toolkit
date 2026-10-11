@@ -444,7 +444,10 @@ test('a refused clipboard hands the export back instead of losing it', async () 
   assert.equal(result.mode, 'standard');
 });
 
-test('a write that the clipboard does not reflect is treated as a failure', async () => {
+test('a resolved write is a success even when the read-back disagrees', async () => {
+  // The clipboard read can race the write, or answer from a stale clipboard.
+  // Trusting it turned working copies into "copy was refused", so a resolved
+  // write now stands on its own and the read-back is only a confirmation.
   const { exports } = materialize({
     clipboard: {
       writeText: async () => {},
@@ -457,8 +460,26 @@ test('a write that the clipboard does not reflect is treated as a failure', asyn
   exports.apply(ctx);
   const services = state.registrations[0].definition.inject('session-a');
   const result = await services.exportMarkdown('session-a', { mode: 'brief' });
-  assert.equal(result.ok, false);
-  assert.match(result.detail, /did not change/);
+  assert.equal(result.ok, true, 'the resolved write is not overridden by the read-back');
+});
+
+test('a rejected write still falls back and still reports failure', async () => {
+  const { exports } = materialize({
+    clipboard: {
+      writeText: async () => {
+        throw new Error('Document is not focused');
+      },
+      readText: async () => ''
+    },
+    execCommand: false,
+    fetch: async () => new Response('body', { status: 200 })
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+  const result = await services.exportMarkdown('session-a', { mode: 'brief' });
+  assert.equal(result.ok, false, 'a refused write is still a failure');
+  assert.match(result.detail, /not focused|refused/);
 });
 
 test('an unverifiable clipboard is not treated as a failure', async () => {
