@@ -4,7 +4,22 @@ English | [中文](README.zh.md)
 
 A native plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) that adds the conversation
 affordances the app does not ship: export a whole conversation as Markdown, save it as a file, copy a link that
-reopens it, edit a user message and resend it, and branch a turn away.
+reopens it, and search the content of every conversation.
+
+## Scope
+
+This plugin is **read-only**. It never writes to a Session, never forks one, and
+never submits anything:
+
+- **Export** — Markdown copy in three modes, download, single-turn copy, the
+  copy-failure recovery dialog, a short-lived cache with singleflight.
+- **Navigation** — copy a Session's deep link, and open the Session it names.
+- **Retrieval** — the sidebar content search, via DSH's own full-text index.
+
+Editing a past message, regenerating a reply and deleting a turn were removed in
+0.6.0. DSH's Session log is append-only, so those could only ever work by forking
+a child Session; if an in-place rewrite is not available, they are not worth the
+fork they cost. The last release that had them is `backup/full-toolkit`.
 
 ## Features
 
@@ -15,10 +30,7 @@ reopens it, edit a user message and resend it, and branch a turn away.
 | **Copy the dialogue only** | Sidebar session `…` menu |
 | **Download the conversation as a `.md` file** | Sidebar session `…` menu |
 | **Copy a conversation deep link** | Sidebar session `…` menu and the row hover strip |
-| **Edit a user message and resend** | Turn action row under each completed turn |
-| **Regenerate a turn** | Same row — drops that turn's reply *and its reasoning*, then asks again |
-| **Delete a turn and everything after** | Same row |
-| **Copy one turn** | Same row — user text, reasoning and answer as Markdown |
+| **Copy one turn** | Turn action row under each completed turn — user text, reasoning and answer as Markdown |
 
 Every label is localized (Simplified Chinese and English) and follows the app's active locale.
 
@@ -224,47 +236,7 @@ tokens, so a renamed token degrades appearance rather than blanking the slot.
 | `sidebar.workspaces.session.menu.item` | `copy-markdown` (500), `copy-markdown-brief` (505), `download-markdown` (508), `copy-link` (510) |
 | `sidebar.workspaces.session.row.action` | `copy-markdown` (150), `copy-link` (160) |
 | `conversation.chat.turnTail` | `turn-actions` (300) |
-| `conversation.input.dock` | `resend` (−10) — renders nothing; it exists only because the dock is the one seat that receives both the Session identity and the composer's `input`/`inputActions`, which "edit and resend" needs |
 | `shell.overlay` | `dialogs` (20) — the edit dialog, the confirm dialog and the toast |
-
-### Why editing is a branch, not a rewrite
-
-DSH persists a conversation as an **append-only** log: committed events are never rewritten, and the only
-transcript-cut primitive the platform exposes is
-
-```js
-session.fork({ sessionId, atSeq })   // atSeq is an INCLUSIVE cut
-```
-
-There is no edit, delete, truncate, rewind or resend API anywhere in the release — a full scan of the client bundles
-finds zero matches for `rollback`, `rewind`, `resend`, `editMessage`, `deleteMessage`, `removeMessage`, `hideThinking`
-or `truncateMessages`.
-
-So every action here is expressed as a cut plus, optionally, one resend:
-
-| Action | Cut | Then |
-|---|---|---|
-| Edit and resend | the event before the turn's `turn/start` | open the child, fill the composer with the edited text, submit it |
-| Regenerate | the turn's `user/message` sequence | open the child, resubmit the original text |
-| Delete this turn and after | the event before the turn's `turn/start` | open the child |
-
-**The source conversation is never modified.** Each action creates a new Session and opens it, which is the same
-mechanism the shipped "branch" button uses. A mistake costs one extra session in the sidebar, never history.
-
-### Deep links without a router
-
-DSH's Web shell contains no routing code at all — it never calls `pushState`, `replaceState` or reads
-`location.search`; the open conversation lives in `localStorage["dsh.sessions.current"]`. That leaves the query string
-free:
-
-```
-http://127.0.0.1:19387/?dsh-session=<sessionId>
-```
-
-The plugin writes that link, and on boot reads the same parameter and calls `uiWorkspace.openSession(id)` (repeated a
-few times, because the shell's own `restoreSelection` settles after the lists become ready). The server serves the
-index for a cookie-authenticated root request with extra parameters, so the link works in the same browser without any
-server change.
 
 ## Development notes
 
@@ -293,7 +265,7 @@ server change.
 
 ```sh
 npm run check   # syntax-check every source file, then run the suite
-npm test        # 71 tests
+npm test        # 61 tests
 ```
 
 CI runs `npm run check` on **ubuntu-latest** and **windows-latest**, and prints the pass and skip counts
@@ -313,39 +285,6 @@ as one explicit line on the run summary.
 - `test/client-bundle.test.mjs` — the bundle parses, registers the factory id the loader demands, requires only
   `react`, declares both locale dictionaries with identical key sets, registers exactly the nine claimed entries, and
   renders each component with its documented props.
-
-## Known limitations
-
-- **The sidebar's content search needs the deployment patch above, and its first build needs an idle DSH.** While a
-  turn is running, the index build can fail with `SESSION_QUERY_PERSISTENCE_FAILED`; retry when idle.
-- **No whole-session delete.** DSH exposes no delete RPC for Sessions — only `workspace/archiveSession`. This plugin
-  therefore does not remove conversations; use the shipped Archive action. Deleting the stored
-  `session.v4.jsonl.zstd` by hand would also desynchronise the SQLite search index, so it is deliberately out.
-- **Deleting a turn also deletes the reply to it.** Reasoning cannot be removed on its own: reasoning is part of the
-  assistant step that produced it, and rewriting a stored event is impossible by design. "Regenerate" is the honest
-  version of "delete the thinking process" — it drops the whole step and asks again.
-- **Actions are disabled while a Session is running**, because forking a live conversation produces a child whose
-  prefix ends mid-turn.
-- **Turn actions appear only after the turn index loads** (one request per Session, cached for the page's lifetime).
-  They render nothing until then rather than guessing a cut point.
-- **A deep link only works in a browser that is already authenticated** to that Harness instance — it is a link into
-  your local app, not a share link.
-- **The automatic resend never retries itself.** `inputActions.submit()` carries no idempotency
-  guarantee, so a rejected call may still have delivered the message and a second automatic call could send
-  it twice. A rejection parks the payload in `failed` and shows a small bar above the composer with
-  **Send again** and **Dismiss**; the text also stays in the draft, so pressing Enter by hand works too.
-  Nothing is retried unless you ask.
-- **A prefetched export is only a gesture bridge.** Hovering a row or opening the menu fetches the
-  **default** mode ahead of the click — never `full`, and never all three modes — so the clipboard write
-  happens inside the click's own focused gesture. Concurrent requests for the same Session and mode share
-  one HTTP call, the cached export expires after 5 seconds, and it is dropped outright when the plugin
-  knows the conversation moved on.
-- **The clipboard needs a focused window.** `navigator.clipboard.writeText` rejects with `Document is not
-  focused` when the app is in the background, and the `execCommand` fallback needs focus too. The plugin mitigates
-  this in three ways: it prefetches on row hover and when the menu opens, so the write happens immediately after the
-  click; it verifies the write by reading the clipboard back; and if the write is still refused, it reopens the export
-  in a dialog with a retry button and a download button rather than losing it. A copy failure therefore never costs
-  you the export.
 
 ## License
 

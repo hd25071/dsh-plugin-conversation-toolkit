@@ -2,7 +2,9 @@ name: check
 
 on:
   push:
-    branches: [main]
+    # Feature branches are verified too: a refactor whose checks only ever ran on
+    # the developer's machine is not verified.
+    branches: [main, 'refactor/**']
   pull_request:
   workflow_dispatch:
 
