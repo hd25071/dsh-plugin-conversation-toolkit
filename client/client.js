@@ -249,6 +249,47 @@ window.__ModuleLoader__.load({
      */
     const pendingResend = new Map();
 
+    /** Where a parked payload is kept so a client reload cannot lose it. */
+    const PENDING_STORE_KEY = 'conversation-toolkit.pending-resend';
+
+    /**
+     * Persist the payloads that are waiting for a user action.
+     *
+     * Only parked ones are stored. A `pending` record may already have reached
+     * the Host, and rehydrating it would risk sending the same message twice —
+     * the very thing the retry check exists to prevent. Storage is best-effort:
+     * a browser that refuses it still gets the in-memory behaviour.
+     */
+    function persistPending() {
+      try {
+        const parked = [...pendingResend.entries()].filter(([, value]) => value.state === 'failed');
+        globalThis.localStorage?.setItem(PENDING_STORE_KEY, JSON.stringify(parked));
+      } catch {
+        // Storage is optional.
+      }
+    }
+
+    /**
+     * Restore parked payloads recorded before a reload.
+     *
+     * @returns nothing.
+     */
+    function rehydratePending() {
+      try {
+        const raw = globalThis.localStorage?.getItem(PENDING_STORE_KEY);
+        if (raw === null || raw === undefined) return;
+        const parked = JSON.parse(raw);
+        if (!Array.isArray(parked)) return;
+        for (const pair of parked) {
+          if (Array.isArray(pair) && pair.length === 2 && !pendingResend.has(pair[0])) {
+            pendingResend.set(pair[0], pair[1]);
+          }
+        }
+      } catch {
+        // A corrupt record is not fatal.
+      }
+    }
+
     /**
      * Advance the resend state machine.
      *
@@ -1405,6 +1446,7 @@ window.__ModuleLoader__.load({
             entry.error = describeError(error);
             notify(t('toast.resendFailed', { detail: entry.error }), 'error');
           }
+          persistPending();
           setTick((value) => value + 1);
         };
 
@@ -1424,7 +1466,9 @@ window.__ModuleLoader__.load({
 
       // The user-operable recovery: the payload stays put, and only a click here
       // (or the user's own Enter in the composer) sends it again.
-      if (entry === undefined || entry.state !== 'failed') return null;
+      if (entry === undefined) return null;
+      // A parked payload needs the user; a pending one is still on its way.
+      const parked = entry.state === 'failed';
 
       /**
        * Retry, but only after asking the child what it already holds.
@@ -1439,6 +1483,7 @@ window.__ModuleLoader__.load({
           // The rejected submit was accepted after all: drop the payload instead
           // of sending the same message a second time.
           pendingResend.delete(sessionId);
+          persistPending();
           notify(t('resend.alreadySent'));
           setTick((value) => value + 1);
           return;
@@ -1459,8 +1504,38 @@ window.__ModuleLoader__.load({
       const dismiss = () => {
         // The text stays in the composer, so Enter still sends it by hand.
         pendingResend.delete(sessionId);
+        persistPending();
         setTick((value) => value + 1);
       };
+      /**
+       * Put the text back into the composer by hand.
+       *
+       * The automatic publish runs when the dock first renders, which is after the
+       * child's Conversation opens — a window that can be long enough for the user
+       * to wonder whether anything is happening. This is the manual escape hatch.
+       *
+       * @returns nothing.
+       */
+      const publish = () => {
+        if (typeof inputActions?.setDraft === 'function') inputActions.setDraft(entry.text);
+        setTick((value) => value + 1);
+      };
+
+      if (!parked) {
+        // Waiting for the composer. Say so, and offer the text by hand: a silent
+        // wait is indistinguishable from a broken action.
+        return h(
+          'div',
+          {
+            className: 'ctk-resend-pending',
+            role: 'status',
+            style: { display: 'flex', gap: '8px', alignItems: 'center', padding: '6px 10px', fontSize: '12px' }
+          },
+          h('span', { style: { flex: '1' } }, t('resend.working')),
+          h('button', { type: 'button', className: 'ctk-button', onClick: publish }, t('resend.publish'))
+        );
+      }
+
       return h(
         'div',
         {
@@ -1478,17 +1553,20 @@ window.__ModuleLoader__.load({
      * Dock entry: the (invisible) resend plumbing for "edit and resend".
      *
      * The dock is the only seat that receives both the Session identity and the
-     * composer's `input`/`inputActions`, so the pending resend is applied here;
-     * it renders nothing, and therefore occupies no space above the composer.
+     * composer's `input`/`inputActions`, so the pending resend is applied here.
+     * It renders nothing once the text is on its way, but it does report the wait:
+     * the child's Conversation can take a while to open, and a silent gap is
+     * indistinguishable from an action that never ran.
      *
      * @param props - the dock owner props plus the injected services.
-     * @returns `null` in every case.
+     * @returns the status line, the recovery line, or `null`.
      */
     function ComposerDock(props) {
       return h(PendingResend, {
         sessionId: props.sessionId,
         input: props.input,
         inputActions: props.inputActions,
+        session: props.session,
         t: props.t
       });
     }
@@ -1506,6 +1584,10 @@ window.__ModuleLoader__.load({
      * @param ctx - the client root context.
      */
     function apply(ctx) {
+      // A parked payload outlives a reload; the composer would otherwise come back
+      // empty with nothing to retry from.
+      rehydratePending();
+
 
 
 
@@ -1564,6 +1646,8 @@ window.__ModuleLoader__.load({
               'resend.retry': '重试发送',
               'resend.alreadySent': '该消息已经在会话里了，未重复发送',
               'resend.unverifiable': '无法确认消息是否已发出，未重发；内容仍在输入框，确认后可按 Enter 自行发送',
+              'resend.working': '正在把消息放回输入框…',
+              'resend.publish': '现在放入输入框',
               'resend.dismiss': '忽略',
               'close': '关闭',
               'cancel': '取消',
@@ -1612,6 +1696,8 @@ window.__ModuleLoader__.load({
               'resend.retry': 'Send again',
               'resend.alreadySent': 'That message is already in the conversation; nothing was sent',
               'resend.unverifiable': 'Could not confirm whether it was sent, so nothing was resent. The text is still in the composer — press Enter if you are sure',
+              'resend.working': 'Putting the message back into the composer…',
+              'resend.publish': 'Put it in now',
               'resend.dismiss': 'Dismiss',
               'close': 'Close',
               'cancel': 'Cancel',
@@ -1726,6 +1812,7 @@ window.__ModuleLoader__.load({
           const childId = await ctx.sessions.fork({ sessionId, atSeq: cutSeq, increaseTitle: true });
           if (typeof resendText === 'string' && resendText.trim() !== '') {
             pendingResend.set(childId, { text: resendText, state: 'pending', attempts: 0, error: null });
+            persistPending();
           }
           turnCache.drop(childId);
           // Branching is a Session-level change: a cached export of the source was

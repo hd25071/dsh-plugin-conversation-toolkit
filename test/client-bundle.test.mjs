@@ -978,3 +978,63 @@ test("v0.5.2 forking a Session invalidates its cached export", async () => {
   await services.exportMarkdown("session-a", { mode: "standard" });
   assert.equal(transcripts(), 2, "the post-fork export is refetched, not served stale");
 });
+
+// ─── v0.5.3 ─────────────────────────────────────────────────────────────
+
+test("v0.5.3 a parked payload is restored after a client reload", async () => {
+  const store = new Map();
+  const previous = globalThis.localStorage;
+  globalThis.localStorage = {
+    getItem: (key) => (store.has(key) ? store.get(key) : null),
+    setItem: (key, value) => store.set(key, String(value)),
+    removeItem: (key) => store.delete(key)
+  };
+  try {
+    // Exactly what the previous generation wrote before the reload.
+    store.set(
+      "conversation-toolkit.pending-resend",
+      JSON.stringify([["session-child", { text: "hello", state: "failed", attempts: 1, error: "down" }]])
+    );
+    const { exports, React } = materialize({ fetch: routeFetch("nothing like it", "body") });
+    const { ctx, state } = fakeContext();
+    exports.apply(ctx);
+    const services = state.registrations[0].definition.inject("session-a");
+    const dock = state.registrations.find((entry) => entry.definition.name === "conversation.input.dock");
+    const element = dock.component({
+      sessionId: "session-child",
+      input: { draft: "" },
+      inputActions: { setDraft: () => {}, submit: () => Promise.reject(new Error("down")) },
+      services,
+      t: (key) => key
+    });
+    const tree = React.render(element.type, element.props);
+    assert.ok(tree !== null, "the recovery entry came back with the reload");
+    const buttons = tree.props.children.filter((child) => child !== null && child.type === "button");
+    assert.equal(buttons.length, 2, "and it still offers retry and dismiss");
+  } finally {
+    if (previous === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previous;
+  }
+});
+
+test("v0.5.3 a payload waiting on the composer reports the wait", async () => {
+  const { exports, React } = materialize({ fetch: routeFetch("nothing like it", "body") });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject("session-a");
+  await services.forkAndOpen("session-a", 6, "hello");
+  const dock = state.registrations.find((entry) => entry.definition.name === "conversation.input.dock");
+  const element = dock.component({
+    sessionId: "session-child",
+    input: { draft: "hello" },
+    // A submit that never settles keeps the payload in flight.
+    inputActions: { setDraft: () => {}, submit: () => new Promise(() => {}) },
+    services,
+    t: (key) => key
+  });
+  const tree = React.render(element.type, element.props);
+  assert.ok(tree !== null, "the wait is not silent");
+  assert.equal(tree.props.role, "status", "it is reported as a status, not an error");
+  const buttons = tree.props.children.filter((child) => child !== null && child.type === "button");
+  assert.equal(buttons.length, 1, "with a manual way to publish the text");
+});
