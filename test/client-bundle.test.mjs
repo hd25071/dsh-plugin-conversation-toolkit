@@ -1038,3 +1038,31 @@ test("v0.5.3 a payload waiting on the composer reports the wait", async () => {
   const buttons = tree.props.children.filter((child) => child !== null && child.type === "button");
   assert.equal(buttons.length, 1, "with a manual way to publish the text");
 });
+
+// ─── v0.5.4 ─────────────────────────────────────────────────────────────
+
+test("v0.5.4 a registration supplies the plugin services to its component", async () => {
+  const { exports, React } = materialize({ fetch: routeFetch("nothing like it", "body") });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+
+  // Every slot entry must reach its component with services bound, because the
+  // slot itself only ever supplies its own standard and owner props.
+  for (const name of ["conversation.chat.turnTail", "conversation.input.dock"]) {
+    const entry = state.registrations.find((record) => record.definition.name === name);
+    assert.ok(entry !== undefined, `${name} is registered`);
+    assert.equal(entry.definition.inject().turnCache !== undefined, true, `${name} has a Turn cache to bind`);
+  }
+
+  // The turn entry must render with ONLY the slot props: no services handed in.
+  // The binding itself: the slot supplies its own props only, and the
+  // component must still see the plugin services.
+  let received = null;
+  const bound = exports.internals.withServices((props) => {
+    received = props.services;
+    return null;
+  }, { marker: "bound" });
+  bound({ sessionId: "session-a", seq: 1 });
+  assert.equal(received?.marker, "bound", "services reach the component as a prop");
+  assert.equal(state.registrations.every((record) => typeof record.component === "function"), true, "every entry is renderable");
+});

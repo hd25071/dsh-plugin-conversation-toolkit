@@ -1561,6 +1561,23 @@ window.__ModuleLoader__.load({
      * @param props - the dock owner props plus the injected services.
      * @returns the status line, the recovery line, or `null`.
      */
+    /**
+     * Bind the plugin's own services into a slot component's props.
+     *
+     * A registration's `inject` supplies the SLOT's standard and owner props — it
+     * does not carry a plugin value. Reading `props.services` therefore always
+     * yielded `undefined`, and every component that depended on it silently
+     * rendered nothing (a turn entry without its Turn index returns null) or did
+     * nothing when clicked.
+     *
+     * @param Component - the component to bind.
+     * @param services - the plugin's service surface.
+     * @returns the component, with `services` supplied as a prop.
+     */
+    function withServices(Component, services) {
+      return (props) => Component({ ...props, services });
+    }
+
     function ComposerDock(props) {
       return h(PendingResend, {
         sessionId: props.sessionId,
@@ -1584,6 +1601,8 @@ window.__ModuleLoader__.load({
      * @param ctx - the client root context.
      */
     function apply(ctx) {
+
+
       // A parked payload outlives a reload; the composer would otherwise come back
       // empty with nothing to retry from.
       rehydratePending();
@@ -1832,7 +1851,7 @@ window.__ModuleLoader__.load({
             locale: NS,
             inject: () => services
           },
-          CopyMarkdownMenuItem
+          withServices(CopyMarkdownMenuItem, services)
         );
         yield ctx.slots.register(
           {
@@ -1842,7 +1861,7 @@ window.__ModuleLoader__.load({
             locale: NS,
             inject: () => services
           },
-          CopyMarkdownFullMenuItem
+          withServices(CopyMarkdownFullMenuItem, services)
         );
         yield ctx.slots.register(
           {
@@ -1852,7 +1871,7 @@ window.__ModuleLoader__.load({
             locale: NS,
             inject: () => services
           },
-          CopyMarkdownBriefMenuItem
+          withServices(CopyMarkdownBriefMenuItem, services)
         );
         yield ctx.slots.register(
           {
@@ -1862,7 +1881,7 @@ window.__ModuleLoader__.load({
             locale: NS,
             inject: () => services
           },
-          DownloadMarkdownMenuItem
+          withServices(DownloadMarkdownMenuItem, services)
         );
         yield ctx.slots.register(
           {
@@ -1872,7 +1891,7 @@ window.__ModuleLoader__.load({
             locale: NS,
             inject: () => services
           },
-          CopyLinkMenuItem
+          withServices(CopyLinkMenuItem, services)
         );
       });
 
@@ -1885,7 +1904,7 @@ window.__ModuleLoader__.load({
             locale: NS,
             inject: () => services
           },
-          CopyMarkdownRowButton
+          withServices(CopyMarkdownRowButton, services)
         );
         yield ctx.slots.register(
           {
@@ -1895,7 +1914,7 @@ window.__ModuleLoader__.load({
             locale: NS,
             inject: () => services
           },
-          CopyLinkRowButton
+          withServices(CopyLinkRowButton, services)
         );
       });
 
@@ -1908,7 +1927,7 @@ window.__ModuleLoader__.load({
             locale: NS,
             inject: () => services
           },
-          TurnActions
+          withServices(TurnActions, services)
         )
       );
 
@@ -1921,7 +1940,7 @@ window.__ModuleLoader__.load({
             locale: NS,
             inject: () => services
           },
-          ComposerDock
+          withServices(ComposerDock, services)
         )
       );
 
@@ -1934,7 +1953,7 @@ window.__ModuleLoader__.load({
             locale: NS,
             inject: () => services
           },
-          ToolkitOverlay
+          withServices(ToolkitOverlay, services)
         )
       );
 
@@ -1972,7 +1991,7 @@ window.__ModuleLoader__.load({
       inject,
       apply,
       // `internals` is the test seam: pure helpers the bundle tests exercise directly.
-      internals: { deepLink, lastLink, branchPlan, resendNextState }
+      internals: { deepLink, lastLink, branchPlan, resendNextState, withServices }
     };
   }
 });
