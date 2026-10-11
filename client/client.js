@@ -65,8 +65,6 @@ window.__ModuleLoader__.load({
 .ctk-dialog{display:flex;flex-direction:column;gap:14px;box-sizing:border-box;width:min(560px,calc(100vw - 32px));max-height:calc(100vh - 64px);padding:18px;border-radius:var(--dsw-radius-panel,14px);background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);box-shadow:0 12px 40px rgba(0,0,0,.28);font-size:13px;line-height:20px}
 .ctk-dialog-title{font-size:15px;line-height:22px;font-weight:500}
 .ctk-dialog-desc{color:var(--dsw-alias-label-secondary)}
-.ctk-textarea{box-sizing:border-box;width:100%;min-height:150px;max-height:46vh;padding:10px 12px;border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-lg,10px);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:20px;resize:vertical}
-.ctk-textarea:focus{outline:none;border-color:var(--dsw-alias-border-l2)}
 .ctk-dialog-footer{display:flex;justify-content:flex-end;gap:8px}
 .ctk-button{height:32px;padding:0 14px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-lg,10px);background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;cursor:pointer}
 .ctk-button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12))}
@@ -233,94 +231,6 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Pending "resend into the fresh branch" payloads, keyed by child Session id.
-     *
-     * Each entry is a small state machine rather than a bare string, because the
-     * submit is asynchronous and can fail after the draft was already accepted:
-     *
-     * | state        | meaning                                                  |
-     * |--------------|----------------------------------------------------------|
-     * | `pending`    | waiting for the composer to publish the draft             |
-     * | `submitting` | the draft is in place and `submit()` has been called      |
-     * | `failed`     | the submit failed for good; the text is kept for a retry  |
-     *
-     * Success is removal. The entry used to be deleted *before* the submit, so a
-     * rejected submit lost the text with no way to recover it from the plugin.
-     */
-    const pendingResend = new Map();
-
-    /** Where a parked payload is kept so a client reload cannot lose it. */
-    const PENDING_STORE_KEY = 'conversation-toolkit.pending-resend';
-
-    /**
-     * Persist the payloads that are waiting for a user action.
-     *
-     * Only parked ones are stored. A `pending` record may already have reached
-     * the Host, and rehydrating it would risk sending the same message twice —
-     * the very thing the retry check exists to prevent. Storage is best-effort:
-     * a browser that refuses it still gets the in-memory behaviour.
-     */
-    function persistPending() {
-      try {
-        const parked = [...pendingResend.entries()].filter(([, value]) => value.state === 'failed');
-        globalThis.localStorage?.setItem(PENDING_STORE_KEY, JSON.stringify(parked));
-      } catch {
-        // Storage is optional.
-      }
-    }
-
-    /**
-     * Restore parked payloads recorded before a reload.
-     *
-     * @returns nothing.
-     */
-    function rehydratePending() {
-      try {
-        const raw = globalThis.localStorage?.getItem(PENDING_STORE_KEY);
-        if (raw === null || raw === undefined) return;
-        const parked = JSON.parse(raw);
-        if (!Array.isArray(parked)) return;
-        for (const pair of parked) {
-          if (Array.isArray(pair) && pair.length === 2 && !pendingResend.has(pair[0])) {
-            pendingResend.set(pair[0], pair[1]);
-          }
-        }
-      } catch {
-        // A corrupt record is not fatal.
-      }
-    }
-
-    /**
-     * Advance the resend state machine.
-     *
-     * | state      | event           | next       |
-     * |------------|-----------------|------------|
-     * | pending    | draft-published | submitting |
-     * | submitting | accepted        | done       |
-     * | submitting | rejected        | failed     |
-     * | failed     | user-retry      | pending    |
-     *
-     * A rejection parks the payload in `failed` — it never returns to
-     * `submitting` or `pending` on its own. `inputActions.submit()` carries no
-     * idempotency guarantee: a rejected call may still have delivered the message,
-     * so a second automatic call could send it twice. Only the user re-arms it.
-     *
-     * Extracted as a pure function so this invariant is testable without a
-     * renderer.
-     *
-     * @param state - the current state.
-     * @param event - what happened.
-     * @returns the next state.
-     */
-    function resendNextState(state, event) {
-      if (state === 'pending' && event === 'draft-published') return 'submitting';
-      if (state === 'submitting' && event === 'accepted') return 'done';
-      if (state === 'submitting' && event === 'rejected') return 'failed';
-      if (state === 'failed' && event === 'user-retry') return 'pending';
-      return state;
-    }
-
-    /**
      * Check whether the clipboard really holds `text`.
      *
      * @param text - the text that was just written.
@@ -465,9 +375,6 @@ window.__ModuleLoader__.load({
     /** In-flight fetches, so concurrent callers share one request per key. */
     const transcriptInflight = new Map();
 
-    /** Bumped per Session by {@link invalidateTranscript}, to void in-flight writes. */
-    const transcriptGeneration = new Map();
-
     /**
      * Compose the cache key for one export.
      *
@@ -508,20 +415,6 @@ window.__ModuleLoader__.load({
       transcriptCache.set(cacheKey(sessionId, mode), { ...value, at: Date.now() });
     }
 
-    /**
-     * Drop every cached and in-flight export for one Session.
-     *
-     * Called when the conversation is known to have moved on, so a prefetch taken
-     * before the change can never be handed to a copy taken after it.
-     *
-     * @param sessionId - the Session whose cache is stale.
-     */
-    function invalidateTranscript(sessionId) {
-      transcriptGeneration.set(sessionId, (transcriptGeneration.get(sessionId) ?? 0) + 1);
-      const prefix = `${sessionId}\u0000`;
-      for (const key of [...transcriptCache.keys()]) if (key.startsWith(prefix)) transcriptCache.delete(key);
-      for (const key of [...transcriptInflight.keys()]) if (key.startsWith(prefix)) transcriptInflight.delete(key);
-    }
 
     /**
      * Fetch one export, sharing the request with any concurrent caller.
@@ -535,15 +428,8 @@ window.__ModuleLoader__.load({
       const key = cacheKey(sessionId, mode);
       const inflight = transcriptInflight.get(key);
       if (inflight !== undefined) return inflight;
-      const generation = transcriptGeneration.get(sessionId) ?? 0;
       const pending = fetchTranscript(sessionId, { mode })
         .then((value) => {
-          if ((transcriptGeneration.get(sessionId) ?? 0) !== generation) {
-            // Invalidated while in flight. The result is stale for the cache AND
-            // for every caller waiting on this promise, so fetch again rather than
-            // hand stale content back to them.
-            return fetchTranscriptOnce(sessionId, mode);
-          }
           writeCachedTranscript(sessionId, mode, value);
           return value;
         })
@@ -617,30 +503,6 @@ window.__ModuleLoader__.load({
       return body.value;
     }
 
-    /**
-     * Ask a Session whether it already carries this user message.
-     *
-     * A rejected `submit()` does **not** prove the host refused it: the request may
-     * have been accepted with only the response lost. Re-sending the same text then
-     * duplicates the user's message — which is why a user-initiated retry asks the
-     * child what it holds first, instead of trusting the rejection.
-     *
-     * @param sessionId - the Session to inspect.
-     * @param text - the text that was submitted.
-     * @returns `'present'`, `'absent'`, or `'unknown'` when the check cannot run.
-     */
-    async function messageAlreadySent(sessionId, text) {
-      try {
-        // The route answers an envelope: the array is under `turns`.
-        const value = await fetchTurns(sessionId);
-        const turns = value?.turns;
-        if (!Array.isArray(turns)) return 'unknown';
-        return turns.some((turn) => turn?.user != null && turn.user.text === text) ? 'present' : 'absent';
-      } catch {
-        // Never guess: an unverifiable check must not be treated as "absent".
-        return 'unknown';
-      }
-    }
 
     /**
      * Build the deep link for one Session.
@@ -985,28 +847,6 @@ window.__ModuleLoader__.load({
     // Components — Turn actions inside the conversation
     // ───────────────────────────────────────────────────────────────────────
 
-    /**
-     * Decide the fork cut and the resend for one Turn action.
-     *
-     * Every action forks at `cutSeq` — the event *before* the turn — so the child
-     * begins with none of that turn's events. Forking at `dropSeq` instead keeps
-     * the turn's own `user/message`, and because every resending action then
-     * submits that same text again, the child would carry the user's message
-     * twice. `dropSeq` is therefore never a fork point.
-     *
-     * @param turn - one Turn record.
-     * @param action - `'edit'`, `'regenerate'` or `'delete'`.
-     * @param text - the replacement text, for `'edit'`.
-     * @returns `{ cutSeq, resend, text }`, or `null` when the turn has no usable cut.
-     */
-    function branchPlan(turn, action, text) {
-      if (turn === null || turn === undefined || typeof turn.cutSeq !== 'number') return null;
-      return {
-        cutSeq: turn.cutSeq,
-        resend: action !== 'delete',
-        text: action === 'edit' ? (text ?? '') : (turn.user?.text ?? '')
-      };
-    }
 
     /**
      * One Turn's action row: copy, edit-and-resend, regenerate, delete-from-here.
@@ -1060,65 +900,6 @@ window.__ModuleLoader__.load({
         );
       }, [guard, t, turn]);
 
-      const onEdit = React.useCallback(() => {
-        if (!guard()) return;
-        overlayStore.set({
-          ...overlayStore.get(),
-          dialog: {
-            kind: 'edit',
-            sessionId,
-            turn,
-            text: turn.user?.text ?? '',
-            origin: turn.user?.text ?? ''
-          }
-        });
-      }, [guard, sessionId, turn]);
-
-      const onRegenerate = React.useCallback(() => {
-        if (!guard()) return;
-        const plan = branchPlan(turn, 'regenerate');
-        if (plan === null) {
-          notify(t('toast.turnUnknown'), 'error');
-          return;
-        }
-        overlayStore.set({
-          ...overlayStore.get(),
-          dialog: {
-            kind: 'confirm',
-            sessionId,
-            title: t('confirm.regenerate.title'),
-            description: t('confirm.regenerate.desc', { n: String(turn.turn) }),
-            confirmLabel: t('confirm.regenerate.action'),
-            danger: false,
-            text: plan.text,
-            cutSeq: plan.cutSeq,
-            resend: plan.resend
-          }
-        });
-      }, [guard, sessionId, t, turn]);
-
-      const onDelete = React.useCallback(() => {
-        if (!guard()) return;
-        const plan = branchPlan(turn, 'delete');
-        if (plan === null) {
-          notify(t('toast.turnUnknown'), 'error');
-          return;
-        }
-        overlayStore.set({
-          ...overlayStore.get(),
-          dialog: {
-            kind: 'confirm',
-            sessionId,
-            title: t('confirm.deleteTurn.title'),
-            description: t('confirm.deleteTurn.desc', { n: String(turn.turn) }),
-            confirmLabel: t('confirm.deleteTurn.action'),
-            danger: true,
-            cutSeq: plan.cutSeq,
-            resend: plan.resend
-          }
-        });
-      }, [guard, sessionId, t, turn]);
-
       if (turn === undefined || turn === null) return null;
 
       const button = (key, label, icon, onClick, disabled) =>
@@ -1140,10 +921,7 @@ window.__ModuleLoader__.load({
         'div',
         { className: 'ctk-action-row', 'data-ctk': 'turn-actions' },
         h('span', { className: 'ctk-action-label' }, t('turn.label', { n: String(turn.turn) })),
-        button('copy', t('turn.copy'), IconCopy, onCopy, false),
-        button('edit', t('turn.edit'), IconPencil, onEdit, running),
-        button('regen', t('turn.regenerate'), IconRefresh, onRegenerate, running),
-        button('delete', t('turn.delete'), IconTrash, onDelete, running)
+        button('copy', t('turn.copy'), IconCopy, onCopy, false)
       );
     }
 
@@ -1160,27 +938,14 @@ window.__ModuleLoader__.load({
     function ToolkitOverlay({ services, t }) {
       const state = useSnapshot(overlayStore);
       const dialog = state.dialog;
-      const [text, setText] = React.useState('');
       const [busy, setBusy] = React.useState(false);
       const [failure, setFailure] = React.useState(null);
 
-      React.useEffect(() => {
-        setText(dialog?.text ?? '');
-        setFailure(null);
-        setBusy(false);
-      }, [dialog]);
-
-      const close = React.useCallback(() => {
-        overlayStore.set({ ...overlayStore.get(), dialog: null });
-      }, []);
-
+      /** Take the clipboard out of the picture entirely. */
       const closeCopyFailure = React.useCallback(() => {
         overlayStore.set({ ...overlayStore.get(), copyFailure: null });
       }, []);
 
-      const copyFailure = state.copyFailure;
-
-      /** Retry the clipboard inside this click's own focused gesture. */
       const retryCopy = React.useCallback(() => {
         const pending = overlayStore.get().copyFailure;
         if (pending === null || pending === undefined) return;
@@ -1219,128 +984,9 @@ window.__ModuleLoader__.load({
         return () => clearTimeout(timer);
       }, [toast]);
 
-      /**
-       * Run the pending fork and, when asked, carry the text into the new branch.
-       *
-       * @param payload - what to fork and whether to resend.
-       */
-      const commit = React.useCallback(
-        (payload) => {
-          setBusy(true);
-          setFailure(null);
-          services
-            .forkAndOpen(payload.sessionId, payload.cutSeq, payload.resend === true ? payload.text : null)
-            .then((childId) => {
-              close();
-              notify(
-                payload.resend === true ? t('toast.branchResent') : t('toast.branchCreated'),
-                'info'
-              );
-              return childId;
-            })
-            .catch((error) => setFailure(describeError(error)))
-            .finally(() => setBusy(false));
-        },
-        [close, services, t]
-      );
+      const copyFailure = state.copyFailure;
 
       const dialogs = [];
-
-      if (dialog?.kind === 'edit') {
-        const unchanged = text === dialog.origin;
-        dialogs.push(
-          h(
-            'div',
-            { key: 'edit', className: 'ctk-overlay', role: 'presentation', onMouseDown: (event) => {
-              if (event.target === event.currentTarget && !busy) close();
-            } },
-            h(
-              'div',
-              { className: 'ctk-dialog', role: 'dialog', 'aria-modal': true, 'aria-label': t('edit.title') },
-              h('div', { className: 'ctk-dialog-title' }, t('edit.title', { n: String(dialog.turn.turn) })),
-              h('div', { className: 'ctk-dialog-desc' }, t('edit.desc')),
-              h('textarea', {
-                className: 'ctk-textarea',
-                value: text,
-                autoFocus: true,
-                spellCheck: false,
-                onChange: (event) => setText(event.target.value),
-                onKeyDown: (event) => {
-                  if (event.key === 'Escape' && !busy) close();
-                  if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
-                    event.preventDefault();
-                    if (!busy && !unchanged && text.trim() !== '') {
-                      const plan = branchPlan(dialog.turn, 'edit', text);
-                      if (plan !== null) commit({ sessionId: dialog.sessionId, cutSeq: plan.cutSeq, text: plan.text, resend: plan.resend });
-                    }
-                  }
-                }
-              }),
-              failure !== null ? h('div', { className: 'ctk-dialog-desc', role: 'alert' }, failure) : null,
-              h(
-                'div',
-                { className: 'ctk-dialog-footer' },
-                h('button', { type: 'button', className: 'ctk-button', disabled: busy, onClick: close }, t('cancel')),
-                h(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'ctk-button',
-                    'data-variant': 'primary',
-                    disabled: busy || unchanged || text.trim() === '',
-                    onClick: () => {
-                      const plan = branchPlan(dialog.turn, 'edit', text);
-                      if (plan !== null) commit({ sessionId: dialog.sessionId, cutSeq: plan.cutSeq, text: plan.text, resend: plan.resend });
-                    }
-                  },
-                  busy ? t('working') : t('edit.action')
-                )
-              )
-            )
-          )
-        );
-      }
-
-      if (dialog?.kind === 'confirm') {
-        dialogs.push(
-          h(
-            'div',
-            { key: 'confirm', className: 'ctk-overlay', role: 'presentation', onMouseDown: (event) => {
-              if (event.target === event.currentTarget && !busy) close();
-            } },
-            h(
-              'div',
-              { className: 'ctk-dialog', role: 'dialog', 'aria-modal': true, 'aria-label': dialog.title },
-              h('div', { className: 'ctk-dialog-title' }, dialog.title),
-              h('div', { className: 'ctk-dialog-desc' }, dialog.description),
-              h('div', { className: 'ctk-dialog-desc' }, t('confirm.note')),
-              failure !== null ? h('div', { className: 'ctk-dialog-desc', role: 'alert' }, failure) : null,
-              h(
-                'div',
-                { className: 'ctk-dialog-footer' },
-                h('button', { type: 'button', className: 'ctk-button', disabled: busy, onClick: close }, t('cancel')),
-                h(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'ctk-button',
-                    'data-variant': dialog.danger === true ? 'danger' : 'primary',
-                    disabled: busy,
-                    onClick: () =>
-                      commit({
-                        sessionId: dialog.sessionId,
-                        cutSeq: dialog.cutSeq,
-                        text: dialog.text ?? '',
-                        resend: dialog.resend === true
-                      })
-                  },
-                  busy ? t('working') : dialog.confirmLabel
-                )
-              )
-            )
-          )
-        );
-      }
 
       if (copyFailure !== null && copyFailure !== undefined) {
         dialogs.push(
@@ -1391,163 +1037,6 @@ window.__ModuleLoader__.load({
       return dialogs.length === 0 ? null : h(React.Fragment, null, dialogs);
     }
 
-    /**
-     * Apply the pending "resend" payload once the fresh branch is mounted.
-     *
-     * The composer renders before its editor is bound, so the payload is applied
-     * in two steps: fill the draft, then submit only after the published input
-     * state really carries the text.
-     *
-     * @param props - the dock props carrying the live input state.
-     * @returns nothing; this is a behaviour-only component.
-     */
-    function PendingResend({ sessionId, input, inputActions, t }) {
-      const entry = pendingResend.get(sessionId);
-      // The record is mutated in place, so React needs an explicit reason to run
-      // the effects again: this counter is it.
-      const [tick, setTick] = React.useState(0);
-      const [busy, setBusy] = React.useState(false);
-
-      // Step 1: publish the text into the composer.
-      //
-      // `tick` is a dependency because a retry must re-publish: the editor may
-      // have been cleared while the payload was parked, and re-entering `pending`
-      // alone changes no dependency of this effect.
-      React.useEffect(() => {
-        if (entry === undefined || entry.state !== 'pending') return;
-        if (inputActions?.setDraft === undefined) return;
-        inputActions.setDraft(entry.text);
-      }, [entry, inputActions, tick]);
-
-      // Step 2: submit exactly once, then stop.
-      React.useEffect(() => {
-        if (entry === undefined || entry.state !== 'pending') return undefined;
-        if (input?.draft !== entry.text) return undefined;
-        if (typeof inputActions?.submit !== 'function') return undefined;
-
-        entry.state = resendNextState(entry.state, 'draft-published');
-        entry.attempts += 1;
-
-        /**
-         * Park or finish the payload.
-         *
-         * @param outcome - `'accepted'` or `'rejected'`.
-         * @param error - the rejection reason, when there is one.
-         */
-        const settle = (outcome, error) => {
-          const next = resendNextState('submitting', outcome);
-          entry.state = next;
-          // Whether it was accepted or not, this Session may have just gained a
-          // turn; never serve an export taken before the attempt.
-          invalidateTranscript(sessionId);
-          if (next === 'done') {
-            pendingResend.delete(sessionId);
-          } else {
-            entry.error = describeError(error);
-            notify(t('toast.resendFailed', { detail: entry.error }), 'error');
-          }
-          persistPending();
-          setTick((value) => value + 1);
-        };
-
-        try {
-          const outcome = inputActions.submit();
-          if (outcome !== null && outcome !== undefined && typeof outcome.then === 'function') {
-            // A rejection parks the payload; it is never retried automatically.
-            outcome.then(() => settle('accepted')).catch((error) => settle('rejected', error));
-          } else {
-            settle('accepted');
-          }
-        } catch (error) {
-          settle('rejected', error);
-        }
-        return undefined;
-      }, [entry, input, inputActions, sessionId, t, tick]);
-
-      // The user-operable recovery: the payload stays put, and only a click here
-      // (or the user's own Enter in the composer) sends it again.
-      if (entry === undefined) return null;
-      // A parked payload needs the user; a pending one is still on its way.
-      const parked = entry.state === 'failed';
-
-      /**
-       * Retry, but only after asking the child what it already holds.
-       *
-       * @returns nothing.
-       */
-      const retry = async () => {
-        setBusy(true);
-        const already = await messageAlreadySent(sessionId, entry.text);
-        setBusy(false);
-        if (already === 'present') {
-          // The rejected submit was accepted after all: drop the payload instead
-          // of sending the same message a second time.
-          pendingResend.delete(sessionId);
-          persistPending();
-          notify(t('resend.alreadySent'));
-          setTick((value) => value + 1);
-          return;
-        }
-        if (already === 'unknown') {
-          entry.error = t('resend.unverifiable');
-          notify(t('resend.unverifiable'), 'error');
-          setTick((value) => value + 1);
-          return;
-        }
-        // Re-publish explicitly as well as through the effect, because the editor
-        // may have been cleared while the payload was parked.
-        if (typeof inputActions?.setDraft === 'function') inputActions.setDraft(entry.text);
-        entry.state = resendNextState('failed', 'user-retry');
-        entry.error = null;
-        setTick((value) => value + 1);
-      };
-      const dismiss = () => {
-        // The text stays in the composer, so Enter still sends it by hand.
-        pendingResend.delete(sessionId);
-        persistPending();
-        setTick((value) => value + 1);
-      };
-      /**
-       * Put the text back into the composer by hand.
-       *
-       * The automatic publish runs when the dock first renders, which is after the
-       * child's Conversation opens — a window that can be long enough for the user
-       * to wonder whether anything is happening. This is the manual escape hatch.
-       *
-       * @returns nothing.
-       */
-      const publish = () => {
-        if (typeof inputActions?.setDraft === 'function') inputActions.setDraft(entry.text);
-        setTick((value) => value + 1);
-      };
-
-      if (!parked) {
-        // Waiting for the composer. Say so, and offer the text by hand: a silent
-        // wait is indistinguishable from a broken action.
-        return h(
-          'div',
-          {
-            className: 'ctk-resend-pending',
-            role: 'status',
-            style: { display: 'flex', gap: '8px', alignItems: 'center', padding: '6px 10px', fontSize: '12px' }
-          },
-          h('span', { style: { flex: '1' } }, t('resend.working')),
-          h('button', { type: 'button', className: 'ctk-button', onClick: publish }, t('resend.publish'))
-        );
-      }
-
-      return h(
-        'div',
-        {
-          className: 'ctk-resend-failed',
-          role: 'alert',
-          style: { display: 'flex', gap: '8px', alignItems: 'center', padding: '6px 10px', fontSize: '12px' }
-        },
-        h('span', { style: { flex: '1' } }, t('resend.failed', { detail: entry.error ?? '' })),
-        h('button', { type: 'button', className: 'ctk-button', disabled: busy, onClick: retry }, busy ? t('working') : t('resend.retry')),
-        h('button', { type: 'button', className: 'ctk-button', onClick: dismiss }, t('resend.dismiss'))
-      );
-    }
 
     /**
      * Dock entry: the (invisible) resend plumbing for "edit and resend".
@@ -1578,15 +1067,6 @@ window.__ModuleLoader__.load({
       return (props) => Component({ ...props, services });
     }
 
-    function ComposerDock(props) {
-      return h(PendingResend, {
-        sessionId: props.sessionId,
-        input: props.input,
-        inputActions: props.inputActions,
-        session: props.session,
-        t: props.t
-      });
-    }
 
     // ───────────────────────────────────────────────────────────────────────
     // Plugin body
@@ -1603,9 +1083,6 @@ window.__ModuleLoader__.load({
     function apply(ctx) {
 
 
-      // A parked payload outlives a reload; the composer would otherwise come back
-      // empty with nothing to retry from.
-      rehydratePending();
 
 
 
@@ -1635,19 +1112,6 @@ window.__ModuleLoader__.load({
               'menu.copyLink': '复制对话链接',
               'turn.label': '第 {n} 轮',
               'turn.copy': '复制本轮对话',
-              'turn.edit': '编辑并重新发送',
-              'turn.regenerate': '重新生成（丢弃该轮回答与思考）',
-              'turn.delete': '删除此轮及之后的对话',
-              'edit.title': '编辑第 {n} 轮的用户消息',
-              'edit.desc': '保存后会从这一轮之前分叉出一个新会话，并把修改后的内容放进输入框重新发送。原会话不会被改动。',
-              'edit.action': '分叉并重新发送',
-              'confirm.regenerate.title': '重新生成这一轮',
-              'confirm.regenerate.desc': '将丢弃第 {n} 轮助手的回答与思考过程，从该轮用户消息处重新提问。',
-              'confirm.regenerate.action': '分叉并重新提问',
-              'confirm.deleteTurn.title': '删除这一轮及之后的对话',
-              'confirm.deleteTurn.desc': '第 {n} 轮及其之后的全部对话都不会出现在新会话里。',
-              'confirm.deleteTurn.action': '分叉并删除',
-              'confirm.note': 'DSH 的会话日志是只追加、不可改写的，因此这里的分叉只创建新会话，原会话保持原样，可随时回退。',
               'toast.linkCopied': '对话链接已复制',
               'toast.markdownCopied': '已复制 Markdown（{n} 字符）',
               'toast.markdownSaved': '已保存 {name}',
@@ -1656,18 +1120,8 @@ window.__ModuleLoader__.load({
               'toast.copyFailed': '复制失败，请重试',
               'toast.copyFailedDetail': '复制失败：{detail}',
               'toast.turnCopied': '本轮对话已复制',
-              'toast.branchCreated': '已在新分支中打开',
-              'toast.branchResent': '已在新分支中重新发送',
               'toast.sessionRunning': '该会话正在运行，请先停止再操作',
               'toast.turnUnknown': '这一轮的日志尚未就绪，请稍后重试',
-              'toast.resendFailed': '自动发送失败（{detail}），内容已保留，可点重试或自行按 Enter 发送',
-              'resend.failed': '自动发送失败：{detail}',
-              'resend.retry': '重试发送',
-              'resend.alreadySent': '该消息已经在会话里了，未重复发送',
-              'resend.unverifiable': '无法确认消息是否已发出，未重发；内容仍在输入框，确认后可按 Enter 自行发送',
-              'resend.working': '正在把消息放回输入框…',
-              'resend.publish': '现在放入输入框',
-              'resend.dismiss': '忽略',
               'close': '关闭',
               'cancel': '取消',
               'working': '处理中…'
@@ -1685,19 +1139,6 @@ window.__ModuleLoader__.load({
               'menu.copyLink': 'Copy conversation link',
               'turn.label': 'Turn {n}',
               'turn.copy': 'Copy this turn',
-              'turn.edit': 'Edit and resend',
-              'turn.regenerate': 'Regenerate (discard this reply and its thinking)',
-              'turn.delete': 'Delete this turn and everything after',
-              'edit.title': 'Edit the user message of turn {n}',
-              'edit.desc': 'Saving branches a new Session off the point before this turn and puts the edited text back in the composer. The original conversation is left untouched.',
-              'edit.action': 'Branch and resend',
-              'confirm.regenerate.title': 'Regenerate this turn',
-              'confirm.regenerate.desc': 'Discards the assistant reply and its reasoning for turn {n}, then asks again from that user message.',
-              'confirm.regenerate.action': 'Branch and ask again',
-              'confirm.deleteTurn.title': 'Delete this turn and everything after',
-              'confirm.deleteTurn.desc': 'Turn {n} and every later turn are omitted from the new Session.',
-              'confirm.deleteTurn.action': 'Branch and delete',
-              'confirm.note': 'DSH session logs are append-only and never rewritten, so this branch only creates a new Session. The original stays exactly as it is and remains available.',
               'toast.linkCopied': 'Conversation link copied',
               'toast.markdownCopied': 'Markdown copied ({n} characters)',
               'toast.markdownSaved': 'Saved {name}',
@@ -1706,18 +1147,8 @@ window.__ModuleLoader__.load({
               'toast.copyFailed': 'Copy failed; try again',
               'toast.copyFailedDetail': 'Copy failed: {detail}',
               'toast.turnCopied': 'Turn copied',
-              'toast.branchCreated': 'Opened in a new branch',
-              'toast.branchResent': 'Resent in a new branch',
               'toast.sessionRunning': 'This Session is running; stop it first',
               'toast.turnUnknown': 'This turn is not readable yet; try again shortly',
-              'toast.resendFailed': 'Automatic send failed ({detail}); the text is kept — retry, or press Enter yourself',
-              'resend.failed': 'Automatic send failed: {detail}',
-              'resend.retry': 'Send again',
-              'resend.alreadySent': 'That message is already in the conversation; nothing was sent',
-              'resend.unverifiable': 'Could not confirm whether it was sent, so nothing was resent. The text is still in the composer — press Enter if you are sure',
-              'resend.working': 'Putting the message back into the composer…',
-              'resend.publish': 'Put it in now',
-              'resend.dismiss': 'Dismiss',
               'close': 'Close',
               'cancel': 'Cancel',
               'working': 'Working…'
@@ -1775,14 +1206,6 @@ window.__ModuleLoader__.load({
           }
         },
         /**
-         * Forget a Session's cached export, for callers that know it moved on.
-         *
-         * @param sessionId - the Session whose cache is stale.
-         */
-        invalidate(sessionId) {
-          invalidateTranscript(sessionId);
-        },
-        /**
          * Copy already-fetched text, for the focused retry in the fallback dialog.
          *
          * @param text - the text to copy.
@@ -1826,20 +1249,6 @@ window.__ModuleLoader__.load({
          * @param resendText - text to submit in the child, or null.
          * @returns the new Session id.
          */
-        async forkAndOpen(sessionId, cutSeq, resendText) {
-          if (typeof cutSeq !== 'number' || cutSeq < 0) throw new Error('the cut point is not available for this turn');
-          const childId = await ctx.sessions.fork({ sessionId, atSeq: cutSeq, increaseTitle: true });
-          if (typeof resendText === 'string' && resendText.trim() !== '') {
-            pendingResend.set(childId, { text: resendText, state: 'pending', attempts: 0, error: null });
-            persistPending();
-          }
-          turnCache.drop(childId);
-          // Branching is a Session-level change: a cached export of the source was
-          // taken before it, so it must not be handed to a copy taken after it.
-          invalidateTranscript(sessionId);
-          ctx.uiWorkspace.openSession(childId);
-          return childId;
-        }
       };
 
       ctx.slots.inject('sidebar.workspaces.session.menu.item', function* () {
@@ -1931,18 +1340,6 @@ window.__ModuleLoader__.load({
         )
       );
 
-      ctx.slots.inject('conversation.input.dock', () =>
-        ctx.slots.register(
-          {
-            name: 'conversation.input.dock',
-            id: 'conversation-toolkit.resend',
-            order: -10,
-            locale: NS,
-            inject: () => services
-          },
-          withServices(ComposerDock, services)
-        )
-      );
 
       ctx.slots.inject('shell.overlay', () =>
         ctx.slots.register(
@@ -1991,7 +1388,7 @@ window.__ModuleLoader__.load({
       inject,
       apply,
       // `internals` is the test seam: pure helpers the bundle tests exercise directly.
-      internals: { deepLink, lastLink, branchPlan, resendNextState, withServices }
+      internals: { deepLink, lastLink, withServices }
     };
   }
 });
