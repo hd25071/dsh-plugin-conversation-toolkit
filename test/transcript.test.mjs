@@ -274,7 +274,7 @@ function forkPrefix(events, cutSeq) {
   return events.filter((event) => event.seq <= cutSeq);
 }
 
-test('a real stored Session log folds and branches correctly', (t) => {
+test('integration: a real stored Session log folds and branches correctly (skipped without a local DSH home)', (t) => {
   const file = findSessionLog((header, log) => header.origin !== 'subagent' && log.events.length > 40);
   if (file === undefined) {
     t.skip('no stored DSH Session log on this machine');
@@ -460,7 +460,7 @@ test('v0.5.1 forking at dropSeq duplicates the user message, forking at cutSeq d
   assert.equal(countText(forkPrefix(EVENTS, second.cutSeq)), 0, 'the turn is fully absent from the prefix');
 });
 
-test('v0.5.1 a real log never duplicates a user message through any branch action', (t) => {
+test('integration: a real log never duplicates a user message through any branch action (skipped without a local DSH home)', (t) => {
   const file = findSessionLog((header, log) => header.origin !== 'subagent' && log.events.length > 40);
   if (file === undefined) {
     t.skip('no stored DSH Session log on this machine');

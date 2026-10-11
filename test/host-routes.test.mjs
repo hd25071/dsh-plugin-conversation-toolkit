@@ -253,3 +253,23 @@ test('HEAD answers with the same status and no body', async () => {
   assert.equal(response.status, 200);
   assert.equal(await response.text(), '');
 });
+
+test('the turns route answers an envelope whose array is under `turns`', async () => {
+  // The client reads `value.turns`. A fixture written against `value` itself
+  // would pass while the real call returns "unknown", so the shape is pinned
+  // here, on the host side, where it is produced.
+  const harness = fakeContext({ sessionQuery: fakeQuery() });
+  apply(harness.ctx);
+  const body = await (await harness.call(TURNS_PATH, 'sessionId=session-x')).json();
+  assert.equal(body.ok, true);
+  assert.equal(body.value.sessionId, 'session-x');
+  assert.ok(Array.isArray(body.value.turns), 'the array lives under value.turns');
+  assert.equal(typeof body.value.eventCount, 'number');
+  assert.equal(body.value.turns.length > 0, true, 'and it carries the folded turns');
+  // Turn 1 has nothing before it, so its cut is null; every other turn must
+  // carry the inclusive seq the client forks at.
+  assert.ok(
+    body.value.turns.every((turn) => turn.cutSeq === null || typeof turn.cutSeq === 'number'),
+    'every turn carries the fork cut the client uses'
+  );
+});

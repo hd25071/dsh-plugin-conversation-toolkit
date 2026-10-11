@@ -268,11 +268,14 @@ http://127.0.0.1:19387/?dsh-session=<sessionId>
 
 ```sh
 npm run check   # 先对所有源文件做语法检查，再跑测试
-npm test        # 66 个测试
+npm test        # 71 个测试
 ```
 
-CI 在 **ubuntu-latest** 与 **windows-latest** 上跑 `npm run check`，并把通过数/跳过数以一行明确输出
-（`tests=66 pass=66 fail=0 skipped=0`）写到运行摘要里。
+CI 在 **ubuntu-latest** 与 **windows-latest** 上跑 `npm run check`，并把通过数/跳过数以一行明确输出到运行摘要里。
+
+**要看跳过数，不能只看通过数。** 有两个测试标了 `integration:`，需要本机 DSH home 里真实的
+`session.v4.jsonl.zstd`。开发机上有，跑出来是 `tests=71 pass=71 fail=0 skipped=0`；
+GitHub 托管运行器没有，同一套测试会报 `skipped=2`。两者都对 —— 它们本来就不是同一次运行。
 
 - `test/transcript.test.mjs` —— 用合成两回合日志**以及**本机 Harness home 里最大的真实 `session.v4.jsonl.zstd` 做折叠。
   真实日志那一例会断言：每个算出来的截断点都指向真实存在的事件（`session.fork` 的要求）、默认导出为每个折叠出的回合

@@ -497,8 +497,13 @@ window.__ModuleLoader__.load({
       const generation = transcriptGeneration.get(sessionId) ?? 0;
       const pending = fetchTranscript(sessionId, { mode })
         .then((value) => {
-          // A fetch that started before an invalidation must not repopulate the cache.
-          if ((transcriptGeneration.get(sessionId) ?? 0) === generation) writeCachedTranscript(sessionId, mode, value);
+          if ((transcriptGeneration.get(sessionId) ?? 0) !== generation) {
+            // Invalidated while in flight. The result is stale for the cache AND
+            // for every caller waiting on this promise, so fetch again rather than
+            // hand stale content back to them.
+            return fetchTranscriptOnce(sessionId, mode);
+          }
+          writeCachedTranscript(sessionId, mode, value);
           return value;
         })
         .finally(() => {
@@ -569,6 +574,31 @@ window.__ModuleLoader__.load({
       const body = await response.json().catch(() => null);
       if (!response.ok || body?.ok !== true) throw new Error(body?.error?.message ?? `HTTP ${String(response.status)}`);
       return body.value;
+    }
+
+    /**
+     * Ask a Session whether it already carries this user message.
+     *
+     * A rejected `submit()` does **not** prove the host refused it: the request may
+     * have been accepted with only the response lost. Re-sending the same text then
+     * duplicates the user's message — which is why a user-initiated retry asks the
+     * child what it holds first, instead of trusting the rejection.
+     *
+     * @param sessionId - the Session to inspect.
+     * @param text - the text that was submitted.
+     * @returns `'present'`, `'absent'`, or `'unknown'` when the check cannot run.
+     */
+    async function messageAlreadySent(sessionId, text) {
+      try {
+        // The route answers an envelope: the array is under `turns`.
+        const value = await fetchTurns(sessionId);
+        const turns = value?.turns;
+        if (!Array.isArray(turns)) return 'unknown';
+        return turns.some((turn) => turn?.user != null && turn.user.text === text) ? 'present' : 'absent';
+      } catch {
+        // Never guess: an unverifiable check must not be treated as "absent".
+        return 'unknown';
+      }
     }
 
     /**
@@ -1335,13 +1365,18 @@ window.__ModuleLoader__.load({
       // The record is mutated in place, so React needs an explicit reason to run
       // the effects again: this counter is it.
       const [tick, setTick] = React.useState(0);
+      const [busy, setBusy] = React.useState(false);
 
       // Step 1: publish the text into the composer.
+      //
+      // `tick` is a dependency because a retry must re-publish: the editor may
+      // have been cleared while the payload was parked, and re-entering `pending`
+      // alone changes no dependency of this effect.
       React.useEffect(() => {
         if (entry === undefined || entry.state !== 'pending') return;
         if (inputActions?.setDraft === undefined) return;
         inputActions.setDraft(entry.text);
-      }, [entry, inputActions]);
+      }, [entry, inputActions, tick]);
 
       // Step 2: submit exactly once, then stop.
       React.useEffect(() => {
@@ -1361,6 +1396,9 @@ window.__ModuleLoader__.load({
         const settle = (outcome, error) => {
           const next = resendNextState('submitting', outcome);
           entry.state = next;
+          // Whether it was accepted or not, this Session may have just gained a
+          // turn; never serve an export taken before the attempt.
+          invalidateTranscript(sessionId);
           if (next === 'done') {
             pendingResend.delete(sessionId);
           } else {
@@ -1388,7 +1426,32 @@ window.__ModuleLoader__.load({
       // (or the user's own Enter in the composer) sends it again.
       if (entry === undefined || entry.state !== 'failed') return null;
 
-      const retry = () => {
+      /**
+       * Retry, but only after asking the child what it already holds.
+       *
+       * @returns nothing.
+       */
+      const retry = async () => {
+        setBusy(true);
+        const already = await messageAlreadySent(sessionId, entry.text);
+        setBusy(false);
+        if (already === 'present') {
+          // The rejected submit was accepted after all: drop the payload instead
+          // of sending the same message a second time.
+          pendingResend.delete(sessionId);
+          notify(t('resend.alreadySent'));
+          setTick((value) => value + 1);
+          return;
+        }
+        if (already === 'unknown') {
+          entry.error = t('resend.unverifiable');
+          notify(t('resend.unverifiable'), 'error');
+          setTick((value) => value + 1);
+          return;
+        }
+        // Re-publish explicitly as well as through the effect, because the editor
+        // may have been cleared while the payload was parked.
+        if (typeof inputActions?.setDraft === 'function') inputActions.setDraft(entry.text);
         entry.state = resendNextState('failed', 'user-retry');
         entry.error = null;
         setTick((value) => value + 1);
@@ -1406,7 +1469,7 @@ window.__ModuleLoader__.load({
           style: { display: 'flex', gap: '8px', alignItems: 'center', padding: '6px 10px', fontSize: '12px' }
         },
         h('span', { style: { flex: '1' } }, t('resend.failed', { detail: entry.error ?? '' })),
-        h('button', { type: 'button', className: 'ctk-button', onClick: retry }, t('resend.retry')),
+        h('button', { type: 'button', className: 'ctk-button', disabled: busy, onClick: retry }, busy ? t('working') : t('resend.retry')),
         h('button', { type: 'button', className: 'ctk-button', onClick: dismiss }, t('resend.dismiss'))
       );
     }
@@ -1443,6 +1506,7 @@ window.__ModuleLoader__.load({
      * @param ctx - the client root context.
      */
     function apply(ctx) {
+
 
 
       ctx.effect(() => {
@@ -1498,6 +1562,8 @@ window.__ModuleLoader__.load({
               'toast.resendFailed': '自动发送失败（{detail}），内容已保留，可点重试或自行按 Enter 发送',
               'resend.failed': '自动发送失败：{detail}',
               'resend.retry': '重试发送',
+              'resend.alreadySent': '该消息已经在会话里了，未重复发送',
+              'resend.unverifiable': '无法确认消息是否已发出，未重发；内容仍在输入框，确认后可按 Enter 自行发送',
               'resend.dismiss': '忽略',
               'close': '关闭',
               'cancel': '取消',
@@ -1544,6 +1610,8 @@ window.__ModuleLoader__.load({
               'toast.resendFailed': 'Automatic send failed ({detail}); the text is kept — retry, or press Enter yourself',
               'resend.failed': 'Automatic send failed: {detail}',
               'resend.retry': 'Send again',
+              'resend.alreadySent': 'That message is already in the conversation; nothing was sent',
+              'resend.unverifiable': 'Could not confirm whether it was sent, so nothing was resent. The text is still in the composer — press Enter if you are sure',
               'resend.dismiss': 'Dismiss',
               'close': 'Close',
               'cancel': 'Cancel',
@@ -1660,6 +1728,9 @@ window.__ModuleLoader__.load({
             pendingResend.set(childId, { text: resendText, state: 'pending', attempts: 0, error: null });
           }
           turnCache.drop(childId);
+          // Branching is a Session-level change: a cached export of the source was
+          // taken before it, so it must not be handed to a copy taken after it.
+          invalidateTranscript(sessionId);
           ctx.uiWorkspace.openSession(childId);
           return childId;
         }

@@ -26,6 +26,10 @@ jobs:
 
       # The counts are printed by the spec reporter above; this writes the same
       # numbers as one explicit line, and onto the run summary.
+      #
+      # Expect skipped=2 here: the two "integration:" tests need a real
+      # session.v4.jsonl.zstd from a local DSH home, which a hosted runner does
+      # not have. A developer machine reports skipped=0 for the same suite.
       - name: Report pass and skip counts
         if: always()
         run: npm run test:tap && node tools/ci-summary.mjs

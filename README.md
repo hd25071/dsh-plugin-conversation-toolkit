@@ -293,11 +293,16 @@ server change.
 
 ```sh
 npm run check   # syntax-check every source file, then run the suite
-npm test        # 66 tests
+npm test        # 71 tests
 ```
 
 CI runs `npm run check` on **ubuntu-latest** and **windows-latest**, and prints the pass and skip counts
-as one explicit line (`tests=66 pass=66 fail=0 skipped=0`) on the run summary.
+as one explicit line on the run summary.
+
+**Read the skip count, not just the pass count.** Two tests are marked `integration:` and need a real
+`session.v4.jsonl.zstd` from a local DSH home. A developer machine has one and reports
+`tests=71 pass=71 fail=0 skipped=0`; a GitHub-hosted runner does not, so the same suite reports
+`skipped=2`. Both are correct — they are simply not the same run.
 
 - `test/transcript.test.mjs` — Markdown and Turn folding against a synthetic two-turn log **and** against the largest
   real `session.v4.jsonl.zstd` in the local Harness home. The real-log case asserts that every computed cut point

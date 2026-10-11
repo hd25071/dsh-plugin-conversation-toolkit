@@ -262,6 +262,18 @@ function fakeContext(options = {}) {
   return { ctx, state };
 }
 
+/**
+ * Let pending promises settle.
+ *
+ * A user-initiated retry asks the child Session what it already holds before it
+ * acts, so its effects complete several turns after the click.
+ *
+ * @returns a promise that resolves once the queue drains.
+ */
+async function flush() {
+  for (let round = 0; round < 6; round += 1) await new Promise((resolve) => setImmediate(resolve));
+}
+
 test('the bundle registers the factory id the module loader requires', () => {
   const { record } = materialize();
   assert.equal(record.id, MANIFEST.name, 'the factory id equals the package name');
@@ -757,7 +769,9 @@ test('v0.5.1 a rejected submit runs exactly once and leaves a recovery entry', a
       timers.push(delay);
       return 0;
     },
-    fetch: async () => new Response('body', { status: 200 })
+    // The retry asks the child what it holds before it acts, so the Turn route
+    // must answer with JSON.
+    fetch: routeFetch('nothing like it', 'body')
   });
   const { ctx, state } = fakeContext();
   exports.apply(ctx);
@@ -795,9 +809,172 @@ test('v0.5.1 a rejected submit runs exactly once and leaves a recovery entry', a
   const buttons = tree.props.children.filter((child) => child !== null && child.type === 'button');
   assert.equal(buttons.length, 2, 'retry and dismiss are both offered');
   buttons[0].props.onClick();
+  await flush();
   // The state update re-renders in React; here that is one more pass.
   React.render(dockElement.type, dockElement.props);
-  await new Promise((resolve) => setImmediate(resolve));
+  await flush();
   assert.equal(submits.length, 2, 'the user-initiated retry submits again');
   assert.deepEqual(timers, [], 'still no automatic retry was scheduled');
+});
+
+// ─── v0.5.2 ─────────────────────────────────────────────────────────────
+
+/**
+ * A Turn-index body whose single turn carries `text` as the user message.
+ *
+ * @param text - the user text the child is pretended to hold.
+ * @returns the JSON body.
+ */
+function turnBody(text) {
+  return (
+    // The real Turn route answers an envelope whose array is under `turns`.
+    '{"ok":true,"value":{"sessionId":"session-child","title":"t","eventCount":6,"turns":[' +
+    '{"turn":1,"startSeq":1,"endSeq":6,"cutSeq":0,"dropSeq":null,' +
+    '"user":{"seq":3,"text":' +
+    JSON.stringify(text) +
+    '},"assistant":{"text":"hi","reasoning":"","toolCalls":0}}]}}'
+  );
+}
+
+/**
+ * A fetch stub that answers the Turn route with JSON and everything else with
+ * plain text, which is what the retry check reads.
+ *
+ * @param turnsText - the user text the child holds.
+ * @param transcriptBody - the transcript body.
+ * @returns the stub.
+ */
+function routeFetch(turnsText, transcriptBody) {
+  return async (url) => {
+    const target = String(url);
+    if (target.includes("/turns")) return new Response(turnBody(turnsText), { status: 200 });
+    return new Response(transcriptBody, { status: 200 });
+  };
+}
+
+test("v0.5.2 retry re-publishes the draft after the editor was cleared", async () => {
+  const submits = [];
+  const drafts = [];
+  const { exports, React } = materialize({
+    fetch: routeFetch("something else", "body")
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject("session-a");
+  await services.forkAndOpen("session-a", 6, "hello");
+  const dock = state.registrations.find((entry) => entry.definition.name === "conversation.input.dock");
+
+  const inputActions = {
+    setDraft: (value) => drafts.push(value),
+    submit: () => {
+      submits.push(1);
+      return Promise.reject(new Error("network down"));
+    }
+  };
+  const base = { sessionId: "session-child", inputActions, services, t: (key) => key };
+
+  const element = dock.component({ ...base, input: { draft: "hello" } });
+  React.render(element.type, element.props);
+  await new Promise((resolve) => setImmediate(resolve));
+  const tree = React.render(element.type, element.props);
+  assert.equal(submits.length, 1, "the first submit ran once");
+  assert.ok(tree !== null, "the failure left a recovery entry");
+
+  // The editor cleared the draft after the failure: the case the publishing
+  // effect could not recover from, because none of its deps changed.
+  const cleared = React.render(element.type, { ...element.props, input: { draft: "" } });
+  const buttons = cleared.props.children.filter((child) => child !== null && child.type === "button");
+  assert.equal(buttons.length, 2, "the recovery entry offers retry and dismiss");
+  buttons[0].props.onClick();
+  await flush();
+
+  assert.ok(drafts.length >= 2, "the retry published the draft again");
+  assert.equal(drafts.at(-1), "hello", "and it published the pending text");
+
+  // The composer carries it again, so the gate opens and the send is attempted.
+  React.render(element.type, { ...element.props, input: { draft: "hello" } });
+  await flush();
+  assert.equal(submits.length, 2, "the retry reached the submit gate");
+});
+
+test("v0.5.2 retry refuses to resend a message the child already carries", async () => {
+  const submits = [];
+  const { exports, React } = materialize({
+    // The child already holds the text: the rejected submit WAS accepted.
+    fetch: routeFetch("hello", "body")
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject("session-a");
+  await services.forkAndOpen("session-a", 6, "hello");
+  const dock = state.registrations.find((entry) => entry.definition.name === "conversation.input.dock");
+
+  const inputActions = {
+    setDraft: () => {},
+    submit: () => {
+      submits.push(1);
+      return Promise.reject(new Error("network down"));
+    }
+  };
+  const base = { sessionId: "session-child", input: { draft: "hello" }, inputActions, services, t: (key) => key };
+
+  const element = dock.component(base);
+  React.render(element.type, element.props);
+  await new Promise((resolve) => setImmediate(resolve));
+  const tree = React.render(element.type, element.props);
+  assert.equal(submits.length, 1, "the first submit ran once");
+
+  const buttons = tree.props.children.filter((child) => child !== null && child.type === "button");
+  buttons[0].props.onClick();
+  await flush();
+  React.render(element.type, element.props);
+  await flush();
+  assert.equal(submits.length, 1, "the message is already there, so nothing is resent");
+});
+
+test("v0.5.2 a result invalidated while in flight is discarded, not served", async () => {
+  const calls = [];
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const { exports } = materialize({
+    fetch: async (url) => {
+      calls.push(String(url));
+      if (calls.length === 1) await gate;
+      // The stale body is deliberately longer, so the length tells them apart.
+      return new Response(calls.length === 1 ? "stale-stale-stale" : "fresh", { status: 200 });
+    }
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject("session-a");
+
+  // The awaiting caller here is exportMarkdown itself: it holds the in-flight
+  // promise, so a stale resolution would reach it directly.
+  const pending = services.exportMarkdown("session-a", { mode: "standard" });
+  await Promise.resolve();
+  services.invalidate("session-a");
+  release();
+
+  const copied = await pending;
+  assert.equal(copied.chars, 5, "the awaiting caller receives fresh content, not the invalidated one");
+});
+
+test("v0.5.2 forking a Session invalidates its cached export", async () => {
+  const calls = [];
+  const { exports } = materialize({
+    fetch: async (url) => { calls.push(String(url)); return new Response("body", { status: 200 }); }
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject("session-a");
+  const transcripts = () => calls.filter((url) => url.includes("transcript")).length;
+
+  await services.prefetch("session-a", { mode: "standard" });
+  assert.equal(transcripts(), 1, "the prefetch fetched once");
+
+  await services.forkAndOpen("session-a", 6, "hi");
+  await services.exportMarkdown("session-a", { mode: "standard" });
+  assert.equal(transcripts(), 2, "the post-fork export is refetched, not served stale");
 });
