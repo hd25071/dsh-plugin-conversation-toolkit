@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-conversation-toolkit",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Conversation toolkit for DeepSeek Harness: copy a whole conversation as Markdown, copy a deep link that reopens it, edit a user message and resend it, and branch a turn or its reasoning away.",
   "type": "module",
   "license": "MIT",
@@ -44,8 +44,9 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test test/**/*.test.mjs",
-    "check": "node --check client/client.js && node --test test/**/*.test.mjs"
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "check": "node --check lib/index.js && node --check lib/transcript.js && node --check lib/turns.js && node --check client/client.js && node --check tools/ci-summary.mjs && node --test --test-reporter=spec \"test/**/*.test.mjs\"",
+    "test:tap": "node --test --test-reporter=tap --test-reporter-destination=test-report.tap \"test/**/*.test.mjs\""
   },
   "dsh": {
     "bundle": {

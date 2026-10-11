@@ -35,16 +35,51 @@ const SOURCE = fs.readFileSync(BUNDLE, 'utf8');
  */
 function reactShim() {
   const Fragment = Symbol('Fragment');
-  return {
+  /** The component instance currently rendering. */
+  let current = null;
+
+  const shim = {
     Fragment,
     createElement(type, props, ...children) {
       return { type, props: { ...(props ?? {}), children: children.length > 1 ? children : children[0] } };
     },
     useState(initial) {
-      return [typeof initial === 'function' ? initial() : initial, () => {}];
+      // Bind to this instance: a component may resolve a promise after the render
+      // pass, and reaching for the shared `current` then would be null.
+      const instance = current;
+      const index = instance.index;
+      if (instance.hooks[index] === undefined) {
+        instance.hooks[index] = { value: typeof initial === 'function' ? initial() : initial };
+      }
+      const slot = instance.hooks[index];
+      instance.index += 1;
+      return [
+        slot.value,
+        (next) => {
+          slot.value = typeof next === 'function' ? next(slot.value) : next;
+          if (instance.live) instance.dirty = true;
+        }
+      ];
     },
-    useEffect() {},
-    useLayoutEffect() {},
+    useEffect(fn, deps) {
+      const index = current.index;
+      if (current.hooks[index] === undefined) current.hooks[index] = { deps: undefined, cleanup: undefined };
+      const slot = current.hooks[index];
+      current.index += 1;
+      const changed =
+        deps === undefined ||
+        slot.deps === undefined ||
+        deps.length !== slot.deps.length ||
+        deps.some((value, position) => value !== slot.deps[position]);
+      if (!changed) return;
+      if (typeof slot.cleanup === 'function') slot.cleanup();
+      slot.deps = deps;
+      const cleanup = fn();
+      slot.cleanup = typeof cleanup === 'function' ? cleanup : undefined;
+    },
+    useLayoutEffect(fn, deps) {
+      shim.useEffect(fn, deps);
+    },
     useCallback(fn) {
       return fn;
     },
@@ -52,12 +87,41 @@ function reactShim() {
       return fn();
     },
     useRef(value) {
-      return { current: value };
+      const index = current.index;
+      if (current.hooks[index] === undefined) current.hooks[index] = { ref: { current: value } };
+      current.index += 1;
+      return current.hooks[index].ref;
     },
     useSyncExternalStore(getSnapshot) {
       return getSnapshot();
+    },
+    /**
+     * Render a component, flushing effects and re-rendering while it schedules
+     * state. This is what makes the behaviour-only components testable.
+     *
+     * @param component - the component to render.
+     * @param props - its props.
+     * @returns the element tree.
+     */
+    render(component, props) {
+      const instance = { hooks: [], index: 0, dirty: false, live: true };
+      const previous = current;
+      let tree;
+      let passes = 0;
+      do {
+        instance.dirty = false;
+        instance.index = 0;
+        current = instance;
+        tree = component(props);
+        passes += 1;
+      } while (instance.dirty && passes < 30);
+      // A later update from an in-flight fetch is simply ignored.
+      instance.live = false;
+      current = previous;
+      return tree;
     }
   };
+  return shim;
 }
 
 /**
@@ -80,6 +144,8 @@ function materialize(options = {}) {
   const React = reactShim();
   /** Anchors the bundle created and clicked, i.e. the downloads it requested. */
   const downloads = [];
+  /** Timers the bundle scheduled, recorded rather than run. */
+  const scheduledTimers = [];
   const documentStub = {
     head: { appendChild: (node) => styles.push(node) },
     body: { appendChild() {}, removeChild() {} },
@@ -103,8 +169,19 @@ function materialize(options = {}) {
   const windowStub = { __ModuleLoader__: moduleLoader, location: { href: options.href ?? 'http://127.0.0.1:19387/' } };
   const navigatorStub = { clipboard: options.clipboard ?? { writeText: async () => {} } };
 
-  const run = new Function('window', 'document', 'navigator', 'fetch', SOURCE);
-  run(windowStub, documentStub, navigatorStub, options.fetch ?? (async () => new Response('', { status: 200 })));
+  const run = new Function('window', 'document', 'navigator', 'fetch', 'Date', 'setTimeout', SOURCE);
+  run(
+    windowStub,
+    documentStub,
+    navigatorStub,
+    options.fetch ?? (async () => new Response('', { status: 200 })),
+    options.Date ?? Date,
+    options.setTimeout ??
+      ((fn, delay) => {
+        scheduledTimers.push({ fn, delay });
+        return 0;
+      })
+  );
 
   const record = moduleLoader.registered;
   assert.ok(record !== undefined, 'the bundle registers a factory');
@@ -112,7 +189,7 @@ function materialize(options = {}) {
     assert.equal(specifier, 'react', `the bundle requires only react, saw ${specifier}`);
     return React;
   });
-  return { record, exports, registered, styles, React, downloads };
+  return { record, exports, registered, styles, React, downloads, scheduledTimers };
 }
 
 /**
@@ -248,27 +325,28 @@ test('apply() declares both locale dictionaries with identical key sets', () => 
 });
 
 test('the composer dock entry renders nothing, keeping the search in the sidebar', () => {
-  const { exports } = materialize();
+  const { exports, React } = materialize();
   const { ctx, state } = fakeContext();
   exports.apply(ctx);
   const dock = state.registrations.find((entry) => entry.definition.name === 'conversation.input.dock');
   assert.ok(dock !== undefined, 'the resend plumbing registers into conversation.input.dock');
-  const element = dock.component({
+  const props = {
     sessionId: 'session-a',
     input: { draft: '' },
     inputActions: { setDraft() {}, submit() {} },
     services: state.registrations[0].definition.inject('session-a'),
     t: (key) => key
-  });
-  // One level of shallow render: the dock renders the invisible behaviour
-  // component, and that component draws nothing at all.
+  };
+  // The dock renders the behaviour component, and with nothing pending that
+  // component draws nothing at all.
+  const element = dock.component(props);
   assert.equal(typeof element.type, 'function');
   assert.equal(element.type.name, 'PendingResend');
-  assert.equal(element.type(element.props), null, 'the dock entry adds no visible surface');
+  assert.equal(React.render(element.type, element.props), null, 'the dock entry adds no visible surface');
 });
 
 test('registered components render with their documented props', async () => {
-  const { exports } = materialize();
+  const { exports, React } = materialize();
   const { ctx, state } = fakeContext();
   exports.apply(ctx);
 
@@ -278,6 +356,7 @@ test('registered components render with their documented props', async () => {
     'downloadMarkdown',
     'exportMarkdown',
     'forkAndOpen',
+    'invalidate',
     'openSession',
     'prefetch',
     'rememberLink',
@@ -310,7 +389,8 @@ test('registered components render with their documented props', async () => {
       useSessionStatus,
       t
     };
-    entry.component(props);
+    // Hooks need the driver: a bare call leaves the hook runtime unbound.
+    assert.doesNotThrow(() => React.render(entry.component, props), entry.definition.id + ' renders');
   }
 });
 
@@ -406,6 +486,9 @@ test('copyText and saveText serve the fallback dialog', async () => {
   const written = [];
   const { exports, downloads } = materialize({
     clipboard: { writeText: async (value) => written.push(value) },
+    // The download schedules an object-URL revoke; stubbing it keeps the test
+    // process from idling for the full delay.
+    setTimeout: () => 0,
     fetch: async () => new Response('body', { status: 200 })
   });
   const { ctx, state } = fakeContext();
@@ -512,13 +595,20 @@ test('forkAndOpen refuses a missing cut point instead of forking everything', as
   assert.equal(state.forkCalls.length, 0);
 });
 
-test('a failed automatic send retries exactly once, then stops', () => {
+test('a failed automatic send is never retried without an idempotency guarantee', () => {
   const { exports } = materialize();
-  const { resendAfterFailure } = exports.internals;
-  // One transient rejection is retried; a second failure must not loop.
-  assert.equal(resendAfterFailure(1), 'retry');
-  assert.equal(resendAfterFailure(2), 'give-up');
-  assert.equal(resendAfterFailure(99), 'give-up');
+  const { resendNextState } = exports.internals;
+  // The v0.5.0 behaviour (one automatic retry) was removed on review: a rejected
+  // submit may still have delivered the message, so retrying could send it twice.
+  assert.equal(resendNextState('submitting', 'rejected'), 'failed');
+  assert.notEqual(resendNextState('submitting', 'rejected'), 'submitting');
+  assert.notEqual(resendNextState('submitting', 'rejected'), 'pending');
+  // Only the user re-arms it, and re-arming lands back on the normal submit path.
+  assert.equal(resendNextState('failed', 'user-retry'), 'pending');
+  assert.equal(resendNextState('pending', 'draft-published'), 'submitting');
+  assert.equal(resendNextState('submitting', 'accepted'), 'done');
+  // An unknown event never moves the machine.
+  assert.equal(resendNextState('failed', 'rejected'), 'failed');
 });
 
 test('a prefetched export is reused instead of refetched', async () => {
@@ -558,4 +648,156 @@ test('a failed prefetch is harmless', async () => {
   const result = await services.exportMarkdown('session-a', { mode: 'standard' });
   assert.equal(result.ok, false);
   assert.equal(result.code, 'export');
+});
+
+// ─── v0.5.1 ─────────────────────────────────────────────────────────────
+
+test('v0.5.1 every branch action forks before the turn, so a resend cannot duplicate it', () => {
+  const { exports } = materialize();
+  const { branchPlan } = exports.internals;
+  assert.equal(typeof branchPlan, 'function', 'branchPlan is the testable fork decision');
+  const turn = { turn: 2, cutSeq: 6, dropSeq: 9, user: { text: 'Second question' } };
+  for (const action of ['edit', 'regenerate', 'delete']) {
+    const plan = branchPlan(turn, action, "edited");
+    assert.equal(plan.cutSeq, turn.cutSeq, action + ' forks before the turn');
+    assert.notEqual(plan.cutSeq, turn.dropSeq, action + ' must not fork at dropSeq');
+  }
+  assert.equal(branchPlan(turn, 'regenerate').text, 'Second question');
+  assert.equal(branchPlan(turn, 'regenerate').resend, true);
+  assert.equal(branchPlan(turn, 'delete').resend, false);
+  assert.equal(branchPlan(turn, 'edit', 'edited').text, 'edited');
+  assert.equal(branchPlan({ turn: 1, cutSeq: null }, 'delete'), null, 'an unusable cut has no plan');
+});
+
+test('v0.5.1 concurrent prefetches of one Session and mode are a single request', async () => {
+  const calls = [];
+  const { exports } = materialize({
+    fetch: async (url) => {
+      calls.push(String(url));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return new Response('body', { status: 200 });
+    }
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+
+  const results = await Promise.all([
+    services.prefetch('session-a', { mode: 'standard' }),
+    services.prefetch('session-a', { mode: 'standard' }),
+    services.prefetch('session-a', { mode: 'standard' })
+  ]);
+  assert.deepEqual(results, [true, true, true]);
+  assert.equal(calls.length, 1, 'three concurrent prefetches share one request');
+});
+
+test('v0.5.1 invalidating a Session drops its cached export', async () => {
+  const calls = [];
+  const { exports } = materialize({
+    fetch: async (url) => { calls.push(String(url)); return new Response('body', { status: 200 }); }
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+  assert.equal(typeof services.invalidate, 'function', 'the session-change hook exists');
+  await services.prefetch('session-a', { mode: 'standard' });
+  assert.equal(calls.length, 1);
+  services.invalidate('session-a');
+  await services.exportMarkdown('session-a', { mode: 'standard' });
+  assert.equal(calls.length, 2, 'the invalidated export is refetched');
+});
+
+test('v0.5.1 the prefetch cache is only a gesture bridge', async () => {
+  const clock = { now: 1_000_000 };
+  const calls = [];
+  const { exports } = materialize({
+    Date: { now: () => clock.now },
+    fetch: async (url) => { calls.push(String(url)); return new Response('body', { status: 200 }); }
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+
+  await services.prefetch('session-a', { mode: 'standard' });
+  await services.exportMarkdown('session-a', { mode: 'standard' });
+  assert.equal(calls.length, 1, 'a fresh prefetch is reused');
+
+  clock.now += 11_000;
+  await services.exportMarkdown('session-a', { mode: 'standard' });
+  assert.equal(calls.length, 2, 'an 11s-old prefetch is not reused');
+});
+
+test('v0.5.1 opening the menu never prefetches the full record', () => {
+  const calls = [...SOURCE.matchAll(/prefetch\(([^)]*)\)/g)].map((match) => match[1]);
+  assert.ok(calls.length > 0, "the bundle prefetches something");
+  for (const call of calls) {
+    assert.doesNotMatch(call, /'full'/, 'the full record is never prefetched: ' + call);
+    assert.doesNotMatch(call, /options\.mode/, 'a menu row must not prefetch its own mode: ' + call);
+  }
+});
+
+test('v0.5.1 a rejected submit is never retried automatically', () => {
+  const { exports } = materialize();
+  const { resendNextState } = exports.internals;
+  assert.equal(typeof resendNextState, 'function', 'the resend machine is testable');
+  assert.equal(resendNextState('submitting', 'rejected'), 'failed', 'a rejection parks the payload');
+  assert.equal(resendNextState('failed', 'user-retry'), 'pending', 'only the user re-arms it');
+  assert.equal(resendNextState('submitting', 'accepted'), 'done');
+  assert.equal(resendNextState('pending', 'draft-published'), 'submitting');
+  assert.notEqual(resendNextState('submitting', 'rejected'), 'submitting', 'no automatic retry');
+  assert.notEqual(resendNextState('submitting', 'rejected'), 'pending', 'no automatic re-arm');
+});
+
+test('v0.5.1 a rejected submit runs exactly once and leaves a recovery entry', async () => {
+  const timers = [];
+  const submits = [];
+  const { exports, React } = materialize({
+    // Any scheduled retry would show up here.
+    setTimeout: (fn, delay) => {
+      timers.push(delay);
+      return 0;
+    },
+    fetch: async () => new Response('body', { status: 200 })
+  });
+  const { ctx, state } = fakeContext();
+  exports.apply(ctx);
+  const services = state.registrations[0].definition.inject('session-a');
+
+  // Seed a pending resend the way the plugin does: fork with text.
+  await services.forkAndOpen('session-a', 6, 'hello');
+  const dock = state.registrations.find((entry) => entry.definition.name === 'conversation.input.dock');
+  assert.ok(dock !== undefined, 'the dock component is registered');
+
+  const draft = [];
+  const inputActions = {
+    setDraft: (value) => draft.push(value),
+    submit: () => {
+      submits.push(1);
+      return Promise.reject(new Error('network down'));
+    }
+  };
+  const props = { sessionId: 'session-child', input: { draft: 'hello' }, inputActions, services, t: (key) => key };
+
+  // The dock returns the behaviour element; render that component itself.
+  const dockElement = dock.component(props);
+  React.render(dockElement.type, dockElement.props);
+  // Let the rejection settle, then render again to observe the parked state.
+  await new Promise((resolve) => setImmediate(resolve));
+  const tree = React.render(dockElement.type, dockElement.props);
+
+  assert.equal(submits.length, 1, 'submit ran exactly once; a rejection is never retried blindly');
+  assert.deepEqual(timers, [], 'no retry was scheduled');
+  assert.deepEqual(draft, ['hello'], 'the text was published to the composer');
+  assert.ok(tree !== null, 'the failure leaves a visible recovery entry');
+  assert.equal(tree.props.role, 'alert', 'the recovery entry announces itself');
+
+  // The recovery entry offers a retry, and only that click re-arms the machine.
+  const buttons = tree.props.children.filter((child) => child !== null && child.type === 'button');
+  assert.equal(buttons.length, 2, 'retry and dismiss are both offered');
+  buttons[0].props.onClick();
+  // The state update re-renders in React; here that is one more pass.
+  React.render(dockElement.type, dockElement.props);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(submits.length, 2, 'the user-initiated retry submits again');
+  assert.deepEqual(timers, [], 'still no automatic retry was scheduled');
 });

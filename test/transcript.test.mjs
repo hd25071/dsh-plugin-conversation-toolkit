@@ -362,3 +362,121 @@ test('a real stored Session log folds and branches correctly', (t) => {
     );
   }
 });
+
+// ─── v0.5.1: mode security boundaries ────────────────────────────────────
+
+/** A log carrying an internal compaction summary and local-path metadata. */
+const COMPACTED_EVENTS = [
+  { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
+  { type: 'user/message', seq: 2, time: 2, data: { content: [{ type: 'text', text: 'First question' }] } },
+  {
+    type: 'compaction/summary',
+    seq: 3,
+    time: 3,
+    data: { summary: [{ type: 'text', text: 'COMPACTION-INTERNAL-SUMMARY' }] }
+  },
+  {
+    type: 'assistant/message',
+    seq: 4,
+    time: 4,
+    data: { turn: 1, step: 1, content: [{ type: 'text', text: 'First answer' }] }
+  }
+];
+
+test('v0.5.1 brief and standard never carry an internal compaction summary', () => {
+  for (const mode of ['brief', 'standard']) {
+    const markdown = renderTranscript({ header: HEADER, events: COMPACTED_EVENTS, options: { mode } });
+    assert.doesNotMatch(markdown, /Compacted history/, mode + ' must not label a compaction summary');
+    assert.doesNotMatch(markdown, /COMPACTION-INTERNAL-SUMMARY/, mode + ' must not leak the summary text');
+  }
+  // It stays available in the mode that warns about everything it contains.
+  const full = renderTranscript({ header: HEADER, events: COMPACTED_EVENTS, options: { mode: 'full' } });
+  assert.match(full, /Compacted history/);
+  assert.match(full, /COMPACTION-INTERNAL-SUMMARY/);
+});
+
+test('v0.5.1 the default header does not leak the workspace path or the parent Session', () => {
+  for (const mode of ['brief', 'standard']) {
+    const markdown = renderTranscript({
+      header: { ...HEADER, parentSession: 'session-parent-9999' },
+      events: EVENTS,
+      options: { mode }
+    });
+    assert.doesNotMatch(markdown, /Workspace/, mode + ' must not label a workspace path');
+    assert.ok(!markdown.includes(HEADER.cwd), mode + ' must not leak the cwd');
+    assert.ok(!markdown.includes('session-parent-9999'), mode + ' must not leak the parent Session');
+  }
+  // The full mode already warns about local paths, so the metadata stays there.
+  const full = renderTranscript({
+    header: { ...HEADER, parentSession: 'session-parent-9999' },
+    events: EVENTS,
+    options: { mode: 'full' }
+  });
+  assert.match(full, /Workspace/);
+  assert.ok(full.includes('session-parent-9999'));
+});
+
+test('v0.5.1 mixed legacy switches may only narrow, never widen', () => {
+  // reasoning=false with tools=true must not smuggle reasoning in.
+  const noReasoning = renderTranscript({ header: HEADER, events: EVENTS, options: { reasoning: false, tools: true } });
+  assert.doesNotMatch(noReasoning, /Let me think about it\./);
+  assert.doesNotMatch(noReasoning, /I should read the file\./);
+  // ...and it must not smuggle tool payloads in either.
+  assert.doesNotMatch(noReasoning, /file_path/);
+  assert.doesNotMatch(noReasoning, /file body/);
+
+  // tools=false with reasoning=true must not smuggle tool payloads in.
+  const noTools = renderTranscript({ header: HEADER, events: EVENTS, options: { reasoning: true, tools: false } });
+  assert.doesNotMatch(noTools, /file_path/);
+  assert.doesNotMatch(noTools, /file body/);
+  assert.doesNotMatch(noTools, /Tool call/);
+});
+
+test('v0.5.1 an illegal mode falls back to standard and is never upgraded to full', () => {
+  for (const legacy of [{}, { reasoning: true }, { tools: true }, { reasoning: true, tools: true }]) {
+    const markdown = renderTranscript({ header: HEADER, events: EVENTS, options: { mode: 'everything-please', ...legacy } });
+    assert.match(markdown, /- \*\*Export\*\*: standard/, 'the fallback mode is recorded as standard');
+    assert.doesNotMatch(markdown, /Let me think about it\./, 'an illegal mode must not gain reasoning');
+    assert.doesNotMatch(markdown, /file body/, 'an illegal mode must not gain tool payloads');
+    assert.doesNotMatch(markdown, /\[!WARNING\]/, 'an illegal mode must not become the warning mode');
+  }
+});
+
+// ─── v0.5.1: the regenerate fork must not duplicate the user message ─────
+
+test('v0.5.1 forking at dropSeq duplicates the user message, forking at cutSeq does not', () => {
+  const turns = analyzeTurns(EVENTS);
+  const second = turns[1];
+  const text = second.user.text;
+  const resubmit = { type: 'user/message', seq: 100, time: 100, data: { content: [{ type: 'text', text }] } };
+  const countText = (events) => events.filter((event) => event.type === 'user/message' && event.data.content[0].text === text).length;
+
+  // The defect the review names: dropSeq keeps the turn own user message, and
+  // the automatic resend submits that same text again.
+  assert.equal(countText([...forkPrefix(EVENTS, second.dropSeq), resubmit]), 2, 'dropSeq + resubmit duplicates');
+
+  // The fix: every branch action cuts before the turn, so the resend is the only copy.
+  assert.equal(countText([...forkPrefix(EVENTS, second.cutSeq), resubmit]), 1, 'cutSeq + resubmit keeps one copy');
+  assert.equal(countText(forkPrefix(EVENTS, second.cutSeq)), 0, 'the turn is fully absent from the prefix');
+});
+
+test('v0.5.1 a real log never duplicates a user message through any branch action', (t) => {
+  const file = findSessionLog((header, log) => header.origin !== 'subagent' && log.events.length > 40);
+  if (file === undefined) {
+    t.skip('no stored DSH Session log on this machine');
+    return;
+  }
+  const { events } = readSessionLog(file);
+  const turns = analyzeTurns(events);
+  for (const turn of turns) {
+    if (typeof turn.cutSeq !== "number" || turn.user === null) continue;
+    const text = turn.user.text;
+    const child = [
+      ...forkPrefix(events, turn.cutSeq),
+      { type: 'user/message', seq: 10000000, time: 0, data: { content: [{ type: 'text', text }] } }
+    ];
+    const copies = child.filter((event) => event.type === 'user/message' && event.data.content[0].text === text).length;
+    const inPrefix = forkPrefix(events, turn.cutSeq).filter((event) => event.type === 'user/message' && event.data.content[0].text === text).length;
+    assert.equal(copies, inPrefix + 1, 'turn ' + String(turn.turn) + ' resends exactly one NEW copy');
+  }
+});

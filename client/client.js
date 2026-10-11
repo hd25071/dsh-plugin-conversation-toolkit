@@ -249,24 +249,34 @@ window.__ModuleLoader__.load({
      */
     const pendingResend = new Map();
 
-    /** Delay before the single automatic retry of a failed send. */
-    const RESEND_RETRY_DELAY_MS = 1500;
-
-    /** How many submits one payload may make before the plugin stops trying. */
-    const RESEND_MAX_ATTEMPTS = 2;
-
     /**
-     * Decide what a failed automatic send should do next.
+     * Advance the resend state machine.
      *
-     * Extracted so the bound is testable without a React renderer: a transient
-     * rejection gets exactly one retry, and a second failure stops rather than
-     * looping.
+     * | state      | event           | next       |
+     * |------------|-----------------|------------|
+     * | pending    | draft-published | submitting |
+     * | submitting | accepted        | done       |
+     * | submitting | rejected        | failed     |
+     * | failed     | user-retry      | pending    |
      *
-     * @param attempts - how many submits have already been made.
-     * @returns `'retry'` or `'give-up'`.
+     * A rejection parks the payload in `failed` — it never returns to
+     * `submitting` or `pending` on its own. `inputActions.submit()` carries no
+     * idempotency guarantee: a rejected call may still have delivered the message,
+     * so a second automatic call could send it twice. Only the user re-arms it.
+     *
+     * Extracted as a pure function so this invariant is testable without a
+     * renderer.
+     *
+     * @param state - the current state.
+     * @param event - what happened.
+     * @returns the next state.
      */
-    function resendAfterFailure(attempts) {
-      return attempts < RESEND_MAX_ATTEMPTS ? 'retry' : 'give-up';
+    function resendNextState(state, event) {
+      if (state === 'pending' && event === 'draft-published') return 'submitting';
+      if (state === 'submitting' && event === 'accepted') return 'done';
+      if (state === 'submitting' && event === 'rejected') return 'failed';
+      if (state === 'failed' && event === 'user-retry') return 'pending';
+      return state;
     }
 
     /**
@@ -402,8 +412,20 @@ window.__ModuleLoader__.load({
      */
     const transcriptCache = new Map();
 
-    /** How long a prefetched export stays usable. */
-    const TRANSCRIPT_CACHE_TTL_MS = 30000;
+    /**
+     * How long a prefetched export stays usable.
+     *
+     * Deliberately short: the cache exists to bridge the gap between hovering a
+     * row (or opening the menu) and clicking, not to serve as a document store. A
+     * long window would hand back an export that predates the newest turn.
+     */
+    const TRANSCRIPT_CACHE_TTL_MS = 5000;
+
+    /** In-flight fetches, so concurrent callers share one request per key. */
+    const transcriptInflight = new Map();
+
+    /** Bumped per Session by {@link invalidateTranscript}, to void in-flight writes. */
+    const transcriptGeneration = new Map();
 
     /**
      * Compose the cache key for one export.
@@ -443,6 +465,47 @@ window.__ModuleLoader__.load({
      */
     function writeCachedTranscript(sessionId, mode, value) {
       transcriptCache.set(cacheKey(sessionId, mode), { ...value, at: Date.now() });
+    }
+
+    /**
+     * Drop every cached and in-flight export for one Session.
+     *
+     * Called when the conversation is known to have moved on, so a prefetch taken
+     * before the change can never be handed to a copy taken after it.
+     *
+     * @param sessionId - the Session whose cache is stale.
+     */
+    function invalidateTranscript(sessionId) {
+      transcriptGeneration.set(sessionId, (transcriptGeneration.get(sessionId) ?? 0) + 1);
+      const prefix = `${sessionId}\u0000`;
+      for (const key of [...transcriptCache.keys()]) if (key.startsWith(prefix)) transcriptCache.delete(key);
+      for (const key of [...transcriptInflight.keys()]) if (key.startsWith(prefix)) transcriptInflight.delete(key);
+    }
+
+    /**
+     * Fetch one export, sharing the request with any concurrent caller.
+     *
+     * @param sessionId - the Session to export.
+     * @param mode - the export mode.
+     * @returns the fetched transcript.
+     * @throws when the Host reports a business failure.
+     */
+    function fetchTranscriptOnce(sessionId, mode) {
+      const key = cacheKey(sessionId, mode);
+      const inflight = transcriptInflight.get(key);
+      if (inflight !== undefined) return inflight;
+      const generation = transcriptGeneration.get(sessionId) ?? 0;
+      const pending = fetchTranscript(sessionId, { mode })
+        .then((value) => {
+          // A fetch that started before an invalidation must not repopulate the cache.
+          if ((transcriptGeneration.get(sessionId) ?? 0) === generation) writeCachedTranscript(sessionId, mode, value);
+          return value;
+        })
+        .finally(() => {
+          if (transcriptInflight.get(key) === pending) transcriptInflight.delete(key);
+        });
+      transcriptInflight.set(key, pending);
+      return pending;
     }
 
     /**
@@ -660,9 +723,11 @@ window.__ModuleLoader__.load({
         const closeMenu = useMenuCloser(useMenuOpenState);
         const [busy, setBusy] = React.useState(false);
         // The menu only mounts its rows when it opens, so this is the earliest
-        // safe moment to start the export the click will need.
+        // safe moment to start the export the click will need. Only the DEFAULT
+        // mode is fetched: opening the menu must not pull three documents, and the
+        // full record must never be fetched unasked.
         React.useEffect(() => {
-          void services.prefetch(sessionId, { mode: options.mode });
+          void services.prefetch(sessionId);
         }, [services, sessionId]);
         const onSelect = React.useCallback(() => {
           closeMenu();
@@ -776,7 +841,7 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(false);
       // Hovering the row is the user telling us they are about to copy.
       const onHover = React.useCallback(() => {
-        void services.prefetch(sessionId, { mode: 'standard' });
+        void services.prefetch(sessionId);
       }, [services, sessionId]);
       const onSelect = React.useCallback(() => {
         setBusy(true);
@@ -850,6 +915,29 @@ window.__ModuleLoader__.load({
     // ───────────────────────────────────────────────────────────────────────
 
     /**
+     * Decide the fork cut and the resend for one Turn action.
+     *
+     * Every action forks at `cutSeq` — the event *before* the turn — so the child
+     * begins with none of that turn's events. Forking at `dropSeq` instead keeps
+     * the turn's own `user/message`, and because every resending action then
+     * submits that same text again, the child would carry the user's message
+     * twice. `dropSeq` is therefore never a fork point.
+     *
+     * @param turn - one Turn record.
+     * @param action - `'edit'`, `'regenerate'` or `'delete'`.
+     * @param text - the replacement text, for `'edit'`.
+     * @returns `{ cutSeq, resend, text }`, or `null` when the turn has no usable cut.
+     */
+    function branchPlan(turn, action, text) {
+      if (turn === null || turn === undefined || typeof turn.cutSeq !== 'number') return null;
+      return {
+        cutSeq: turn.cutSeq,
+        resend: action !== 'delete',
+        text: action === 'edit' ? (text ?? '') : (turn.user?.text ?? '')
+      };
+    }
+
+    /**
      * One Turn's action row: copy, edit-and-resend, regenerate, delete-from-here.
      *
      * Every destructive-looking action is a *fork*: it opens a new Session whose
@@ -917,7 +1005,8 @@ window.__ModuleLoader__.load({
 
       const onRegenerate = React.useCallback(() => {
         if (!guard()) return;
-        if (turn.dropSeq === null) {
+        const plan = branchPlan(turn, 'regenerate');
+        if (plan === null) {
           notify(t('toast.turnUnknown'), 'error');
           return;
         }
@@ -930,16 +1019,17 @@ window.__ModuleLoader__.load({
             description: t('confirm.regenerate.desc', { n: String(turn.turn) }),
             confirmLabel: t('confirm.regenerate.action'),
             danger: false,
-            text: turn.user?.text ?? '',
-            cutSeq: turn.dropSeq,
-            resend: true
+            text: plan.text,
+            cutSeq: plan.cutSeq,
+            resend: plan.resend
           }
         });
       }, [guard, sessionId, t, turn]);
 
       const onDelete = React.useCallback(() => {
         if (!guard()) return;
-        if (turn.cutSeq === null) {
+        const plan = branchPlan(turn, 'delete');
+        if (plan === null) {
           notify(t('toast.turnUnknown'), 'error');
           return;
         }
@@ -952,8 +1042,8 @@ window.__ModuleLoader__.load({
             description: t('confirm.deleteTurn.desc', { n: String(turn.turn) }),
             confirmLabel: t('confirm.deleteTurn.action'),
             danger: true,
-            cutSeq: turn.cutSeq,
-            resend: false
+            cutSeq: plan.cutSeq,
+            resend: plan.resend
           }
         });
       }, [guard, sessionId, t, turn]);
@@ -1109,7 +1199,8 @@ window.__ModuleLoader__.load({
                   if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
                     event.preventDefault();
                     if (!busy && !unchanged && text.trim() !== '') {
-                      commit({ sessionId: dialog.sessionId, cutSeq: dialog.turn.cutSeq, text, resend: true });
+                      const plan = branchPlan(dialog.turn, 'edit', text);
+                      if (plan !== null) commit({ sessionId: dialog.sessionId, cutSeq: plan.cutSeq, text: plan.text, resend: plan.resend });
                     }
                   }
                 }
@@ -1126,7 +1217,10 @@ window.__ModuleLoader__.load({
                     className: 'ctk-button',
                     'data-variant': 'primary',
                     disabled: busy || unchanged || text.trim() === '',
-                    onClick: () => commit({ sessionId: dialog.sessionId, cutSeq: dialog.turn.cutSeq, text, resend: true })
+                    onClick: () => {
+                      const plan = branchPlan(dialog.turn, 'edit', text);
+                      if (plan !== null) commit({ sessionId: dialog.sessionId, cutSeq: plan.cutSeq, text: plan.text, resend: plan.resend });
+                    }
                   },
                   busy ? t('working') : t('edit.action')
                 )
@@ -1238,8 +1332,8 @@ window.__ModuleLoader__.load({
      */
     function PendingResend({ sessionId, input, inputActions, t }) {
       const entry = pendingResend.get(sessionId);
-      // A failed submit re-arms through this counter: the record is mutated in
-      // place, so React needs an explicit reason to run the effect again.
+      // The record is mutated in place, so React needs an explicit reason to run
+      // the effects again: this counter is it.
       const [tick, setTick] = React.useState(0);
 
       // Step 1: publish the text into the composer.
@@ -1249,51 +1343,72 @@ window.__ModuleLoader__.load({
         inputActions.setDraft(entry.text);
       }, [entry, inputActions]);
 
-      // Step 2: submit, but only once the composer really carries the text.
+      // Step 2: submit exactly once, then stop.
       React.useEffect(() => {
         if (entry === undefined || entry.state !== 'pending') return undefined;
         if (input?.draft !== entry.text) return undefined;
         if (typeof inputActions?.submit !== 'function') return undefined;
 
-        entry.state = 'submitting';
+        entry.state = resendNextState(entry.state, 'draft-published');
         entry.attempts += 1;
-        let timer = null;
 
         /**
-         * Record a failed send.
+         * Park or finish the payload.
          *
-         * @param error - the thrown or rejected value.
+         * @param outcome - `'accepted'` or `'rejected'`.
+         * @param error - the rejection reason, when there is one.
          */
-        const fail = (error) => {
-          const detail = describeError(error);
-          entry.error = detail;
-          if (resendAfterFailure(entry.attempts) === 'retry') {
-            entry.state = 'pending';
-            notify(t('toast.resendRetrying', { detail }), 'error');
-            timer = setTimeout(() => setTick((value) => value + 1), RESEND_RETRY_DELAY_MS);
-            return;
+        const settle = (outcome, error) => {
+          const next = resendNextState('submitting', outcome);
+          entry.state = next;
+          if (next === 'done') {
+            pendingResend.delete(sessionId);
+          } else {
+            entry.error = describeError(error);
+            notify(t('toast.resendFailed', { detail: entry.error }), 'error');
           }
-          entry.state = 'failed';
-          notify(t('toast.resendFailed', { detail }), 'error');
+          setTick((value) => value + 1);
         };
 
         try {
           const outcome = inputActions.submit();
           if (outcome !== null && outcome !== undefined && typeof outcome.then === 'function') {
-            // The rejection is the case the old code missed entirely.
-            outcome.then(() => pendingResend.delete(sessionId)).catch(fail);
+            // A rejection parks the payload; it is never retried automatically.
+            outcome.then(() => settle('accepted')).catch((error) => settle('rejected', error));
           } else {
-            pendingResend.delete(sessionId);
+            settle('accepted');
           }
         } catch (error) {
-          fail(error);
+          settle('rejected', error);
         }
-        return () => {
-          if (timer !== null) clearTimeout(timer);
-        };
+        return undefined;
       }, [entry, input, inputActions, sessionId, t, tick]);
 
-      return null;
+      // The user-operable recovery: the payload stays put, and only a click here
+      // (or the user's own Enter in the composer) sends it again.
+      if (entry === undefined || entry.state !== 'failed') return null;
+
+      const retry = () => {
+        entry.state = resendNextState('failed', 'user-retry');
+        entry.error = null;
+        setTick((value) => value + 1);
+      };
+      const dismiss = () => {
+        // The text stays in the composer, so Enter still sends it by hand.
+        pendingResend.delete(sessionId);
+        setTick((value) => value + 1);
+      };
+      return h(
+        'div',
+        {
+          className: 'ctk-resend-failed',
+          role: 'alert',
+          style: { display: 'flex', gap: '8px', alignItems: 'center', padding: '6px 10px', fontSize: '12px' }
+        },
+        h('span', { style: { flex: '1' } }, t('resend.failed', { detail: entry.error ?? '' })),
+        h('button', { type: 'button', className: 'ctk-button', onClick: retry }, t('resend.retry')),
+        h('button', { type: 'button', className: 'ctk-button', onClick: dismiss }, t('resend.dismiss'))
+      );
     }
 
     /**
@@ -1328,6 +1443,7 @@ window.__ModuleLoader__.load({
      * @param ctx - the client root context.
      */
     function apply(ctx) {
+
 
       ctx.effect(() => {
         const tag = document.createElement('style');
@@ -1379,8 +1495,10 @@ window.__ModuleLoader__.load({
               'toast.branchResent': '已在新分支中重新发送',
               'toast.sessionRunning': '该会话正在运行，请先停止再操作',
               'toast.turnUnknown': '这一轮的日志尚未就绪，请稍后重试',
-              'toast.resendRetrying': '自动发送失败（{detail}），正在重试一次…',
-              'toast.resendFailed': '自动发送失败（{detail}），内容已放入输入框，请按 Enter 发送',
+              'toast.resendFailed': '自动发送失败（{detail}），内容已保留，可点重试或自行按 Enter 发送',
+              'resend.failed': '自动发送失败：{detail}',
+              'resend.retry': '重试发送',
+              'resend.dismiss': '忽略',
               'close': '关闭',
               'cancel': '取消',
               'working': '处理中…'
@@ -1423,8 +1541,10 @@ window.__ModuleLoader__.load({
               'toast.branchResent': 'Resent in a new branch',
               'toast.sessionRunning': 'This Session is running; stop it first',
               'toast.turnUnknown': 'This turn is not readable yet; try again shortly',
-              'toast.resendRetrying': 'Automatic send failed ({detail}); retrying once…',
-              'toast.resendFailed': 'Automatic send failed ({detail}); the text is in the composer — press Enter',
+              'toast.resendFailed': 'Automatic send failed ({detail}); the text is kept — retry, or press Enter yourself',
+              'resend.failed': 'Automatic send failed: {detail}',
+              'resend.retry': 'Send again',
+              'resend.dismiss': 'Dismiss',
               'close': 'Close',
               'cancel': 'Cancel',
               'working': 'Working…'
@@ -1451,7 +1571,7 @@ window.__ModuleLoader__.load({
         async exportMarkdown(sessionId, options = {}) {
           const mode = options.mode ?? 'standard';
           try {
-            const { text, title } = readCachedTranscript(sessionId, mode) ?? (await fetchTranscript(sessionId, { mode }));
+            const { text, title } = readCachedTranscript(sessionId, mode) ?? (await fetchTranscriptOnce(sessionId, mode));
             const copied = await writeClipboard(text);
             if (copied.ok) return { ok: true, chars: text.length, mode };
             // Hand the text back: the caller reopens it in a dialog whose buttons
@@ -1475,11 +1595,19 @@ window.__ModuleLoader__.load({
           const mode = options.mode ?? 'standard';
           if (readCachedTranscript(sessionId, mode) !== undefined) return true;
           try {
-            writeCachedTranscript(sessionId, mode, await fetchTranscript(sessionId, { mode }));
+            await fetchTranscriptOnce(sessionId, mode);
             return true;
           } catch {
             return false;
           }
+        },
+        /**
+         * Forget a Session's cached export, for callers that know it moved on.
+         *
+         * @param sessionId - the Session whose cache is stale.
+         */
+        invalidate(sessionId) {
+          invalidateTranscript(sessionId);
         },
         /**
          * Copy already-fetched text, for the focused retry in the fallback dialog.
@@ -1686,7 +1814,7 @@ window.__ModuleLoader__.load({
       inject,
       apply,
       // `internals` is the test seam: pure helpers the bundle tests exercise directly.
-      internals: { deepLink, lastLink, resendAfterFailure }
+      internals: { deepLink, lastLink, branchPlan, resendNextState }
     };
   }
 });

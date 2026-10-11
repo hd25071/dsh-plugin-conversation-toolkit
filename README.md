@@ -90,11 +90,38 @@ A transcript can carry material that must not leave the machine by accident — 
 tool arguments carry absolute paths and sometimes tokens, and tool results are frequently file dumps or command
 output. **The default is therefore the narrow one.**
 
-| Mode | Dialogue | Thinking | Tool names | Tool arguments and results | System text | Header warning |
-|---|---|---|---|---|---|---|
-| `brief` | yes | — | — | — | — | — |
-| `standard` **(default)** | yes | — | yes | — | — | — |
-| `full` | yes | yes | yes | yes | yes | yes |
+| Mode | Dialogue | Thinking | Tool names | Tool arguments and results | System text | Compaction summaries | Workspace path | Header warning |
+|---|---|---|---|---|---|---|---|---|
+| `brief` | yes | — | — | — | — | — | — | — |
+| `standard` **(default)** | yes | — | yes | — | — | — | — | — |
+| `full` | yes | yes | yes | yes | yes | yes | yes | yes |
+
+Two things worth stating outright:
+
+- **A compaction summary is internal material.** It stands in for history the user never wrote, so it is
+  only ever part of `full`.
+- **The workspace path and the parent Session id are local-path metadata.** They name this machine's
+  directory layout and another conversation, so they too are only written by `full`.
+
+Neither of those narrows the residual risk, though: **your own messages are included verbatim in every
+mode and can contain secrets.** The narrower modes only remove what the agent added — which is why every
+export carries this line in its header:
+
+```markdown
+- **Careful**: your own messages are included verbatim and may contain secrets.
+```
+
+The legacy `reasoning`/`tools` switches are still accepted, and they can only ever **narrow** the mode:
+
+| Request | Result |
+|---|---|
+| `mode=full` | full |
+| `reasoning=false&tools=true` | standard — no thinking, and no tool payloads either |
+| `reasoning=true&tools=false` | standard — no tool names or payloads, so dialogue only |
+| `mode=nonsense` | standard, **even with** `reasoning=true` — an unknown mode is never widened into full |
+
+`true` is read as a permission, never as a demand, so a mixed pair resolves to the intersection rather
+than to the widest mode.
 
 `standard` is the conversation plus the names of the tools that ran — readable without the payloads. `full` is the
 only mode that can carry a secret, and it says so in the document itself:
@@ -265,8 +292,12 @@ server change.
 ## Verification
 
 ```sh
-npm test        # 53 tests: transcript folding, export modes, escaping, branching, host routes, client bundle
+npm run check   # syntax-check every source file, then run the suite
+npm test        # 66 tests
 ```
+
+CI runs `npm run check` on **ubuntu-latest** and **windows-latest**, and prints the pass and skip counts
+as one explicit line (`tests=66 pass=66 fail=0 skipped=0`) on the run summary.
 
 - `test/transcript.test.mjs` — Markdown and Turn folding against a synthetic two-turn log **and** against the largest
   real `session.v4.jsonl.zstd` in the local Harness home. The real-log case asserts that every computed cut point
@@ -294,6 +325,16 @@ npm test        # 53 tests: transcript folding, export modes, escaping, branchin
   They render nothing until then rather than guessing a cut point.
 - **A deep link only works in a browser that is already authenticated** to that Harness instance — it is a link into
   your local app, not a share link.
+- **The automatic resend never retries itself.** `inputActions.submit()` carries no idempotency
+  guarantee, so a rejected call may still have delivered the message and a second automatic call could send
+  it twice. A rejection parks the payload in `failed` and shows a small bar above the composer with
+  **Send again** and **Dismiss**; the text also stays in the draft, so pressing Enter by hand works too.
+  Nothing is retried unless you ask.
+- **A prefetched export is only a gesture bridge.** Hovering a row or opening the menu fetches the
+  **default** mode ahead of the click — never `full`, and never all three modes — so the clipboard write
+  happens inside the click's own focused gesture. Concurrent requests for the same Session and mode share
+  one HTTP call, the cached export expires after 5 seconds, and it is dropped outright when the plugin
+  knows the conversation moved on.
 - **The clipboard needs a focused window.** `navigator.clipboard.writeText` rejects with `Document is not
   focused` when the app is in the background, and the `execCommand` fallback needs focus too. The plugin mitigates
   this in three ways: it prefetches on row hover and when the menu opens, so the write happens immediately after the
